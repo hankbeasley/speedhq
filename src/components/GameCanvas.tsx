@@ -25,6 +25,30 @@ const DISTANCE_TO_PLAYER = 150;  // player distance from camera along Z
 const CAMERA_DEPTH = 0.8;        // perspective fov multiplier
 const LANE_COUNT = 3;
 
+// Tuned handling model constants. The original game moved the car directly
+// sideways from input, which made the controls feel twitchy at low speeds and
+// imprecise at high speeds. These constants give the car inertia, grip, drag,
+// and a readable arcade top speed while preserving the pseudo-3D render style.
+const LOW_GEAR_TOP_SPEED = 195.0;
+const HIGH_GEAR_TOP_SPEED = 385.0;
+const SPEED_TO_WORLD_MULTIPLIER = 5.0;
+const ROAD_EDGE = 0.98;
+const HARD_SHOULDER_EDGE = 2.0;
+
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const approach = (value: number, target: number, maxDelta: number) => {
+  if (value < target) return Math.min(value + maxDelta, target);
+  if (value > target) return Math.max(value - maxDelta, target);
+  return value;
+};
+
+const normalizeRelativeZ = (relativeZ: number, totalLength: number) => {
+  if (relativeZ < -totalLength / 2) return relativeZ + totalLength;
+  if (relativeZ > totalLength / 2) return relativeZ - totalLength;
+  return relativeZ;
+};
+
 // Map out the continuous looping stage segments
 const SCENERY_STAGES: ActiveScenery[] = [
   { name: "1. COCONUT COAST", climate: 'cost', bgColor: '#021526', accentColor: '#0ea5e9', length: 400 },
@@ -33,6 +57,25 @@ const SCENERY_STAGES: ActiveScenery[] = [
   { name: "4. DESERT DUNES", climate: 'desert', bgColor: '#1c0f05', accentColor: '#f97316', length: 450 },
   { name: "5. BLIZZARD PASS", climate: 'snow', bgColor: '#071624', accentColor: '#a5f3fc', length: 450 }
 ];
+
+const STAGE_BOUNDARIES = SCENERY_STAGES.reduce<Array<{ start: number; end: number }>>((bounds, stage) => {
+  const start = bounds.length === 0 ? 0 : bounds[bounds.length - 1].end;
+  bounds.push({ start, end: start + stage.length });
+  return bounds;
+}, []);
+
+const TOTAL_SCENERY_SEGMENTS = STAGE_BOUNDARIES[STAGE_BOUNDARIES.length - 1].end;
+
+const getStageInfo = (segmentIdx: number) => {
+  const scenerySegment = segmentIdx % TOTAL_SCENERY_SEGMENTS;
+  const stageIdx = STAGE_BOUNDARIES.findIndex(boundary => scenerySegment >= boundary.start && scenerySegment < boundary.end);
+  const safeStageIdx = stageIdx >= 0 ? stageIdx : SCENERY_STAGES.length - 1;
+  const boundary = STAGE_BOUNDARIES[safeStageIdx];
+  return {
+    stageIdx: safeStageIdx,
+    progress: clamp((scenerySegment - boundary.start) / Math.max(boundary.end - boundary.start, 1), 0, 1)
+  };
+};
 
 export default function GameCanvas({ settings, updateSettings, onGameOver }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -46,13 +89,19 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     
     playerX: 0.0,            // current player offset from road center (-1 to +1)
     playerZ: 0.0,            // physical distance along track Z
-    speed: 0.0,              // current speed (km/h) (max ~310.0)
+    speed: 0.0,              // current speed (km/h)
     gear: 'LOW' as 'LOW' | 'HIGH',
     rpm: 0.0,                // engine revs factor (0.0 to 1.0)
     
-    steerInput: 0,          // -1 (left) to +1 (right)
+    steerInput: 0,           // smoothed steering value (-1 to +1)
+    targetSteerInput: 0,     // raw steering target from keyboard/touch/tilt
+    lateralVelocity: 0,      // sideways road-space velocity; gives steering inertia
     accelInput: false,
     brakeInput: false,
+    keySteerLeft: false,
+    keySteerRight: false,
+    touchSteerLeft: false,
+    touchSteerRight: false,
 
     timeLimit: 80.0,         // seconds remaining
     score: 0,
@@ -77,7 +126,8 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
 
     // Stats
     nearMissCount: 0,
-    totalDistanceDriven: 0
+    totalDistanceDriven: 0,
+    uiUpdateTimer: 0
   });
 
   const [uiState, setUiState] = useState({
@@ -119,8 +169,15 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
 
   // Request gyroscope/tilt controls
   useEffect(() => {
-    // When settings change from parent, update mutable references that might be captured in old closures
-    stateRef.current.steeringMode = settings.steeringMode;
+    // When settings change from parent, update mutable references that might be captured in old closures.
+    // Reset held steering so switching modes never leaves the car pulling to one side.
+    const s = stateRef.current;
+    s.steeringMode = settings.steeringMode;
+    s.keySteerLeft = false;
+    s.keySteerRight = false;
+    s.touchSteerLeft = false;
+    s.touchSteerRight = false;
+    s.targetSteerInput = 0;
   }, [settings.steeringMode]);
 
   const requestTiltPermission = async () => {
@@ -172,9 +229,8 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       normalized = Math.min(Math.max(normalized, -1.0), 1.0);
     }
 
-    // In portrait, gamma represents left-right roll. If landscape, it's different.
-    // Let's support an adaptive tilt so it behaves naturally.
-    stateRef.current.steerInput = normalized;
+    // Smooth this in the physics step instead of snapping the car sideways.
+    stateRef.current.targetSteerInput = normalized;
   };
 
   const calibrateTilt = () => {
@@ -193,6 +249,25 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     }
   };
 
+  const updateKeyboardSteerTarget = () => {
+    const s = stateRef.current;
+    s.targetSteerInput = (s.keySteerRight ? 1 : 0) - (s.keySteerLeft ? 1 : 0);
+  };
+
+  const updateTouchSteerTarget = () => {
+    const s = stateRef.current;
+    s.targetSteerInput = (s.touchSteerRight ? 1 : 0) - (s.touchSteerLeft ? 1 : 0);
+  };
+
+  const roadGripForSegment = (segment?: RoadSegment) => {
+    if (!segment) return 1.0;
+    if (segment.climate === 'snow') return 0.72;
+    if (segment.climate === 'desert') return 0.92;
+    if (segment.climate === 'city') return 1.08;
+    if (segment.climate === 'tunnel') return 1.12;
+    return 1.0;
+  };
+
   // Keyboard controls listener
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -206,9 +281,17 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         toggleGear();
       }
       
-      if (settings.steeringMode === 'keyboard') {
-        if (key === 'arrowleft' || key === 'a') { e.preventDefault(); stateRef.current.steerInput = -1.0; }
-        if (key === 'arrowright' || key === 'd') { e.preventDefault(); stateRef.current.steerInput = 1.0; }
+      if (stateRef.current.steeringMode === 'keyboard') {
+        if (key === 'arrowleft' || key === 'a') {
+          e.preventDefault();
+          stateRef.current.keySteerLeft = true;
+          updateKeyboardSteerTarget();
+        }
+        if (key === 'arrowright' || key === 'd') {
+          e.preventDefault();
+          stateRef.current.keySteerRight = true;
+          updateKeyboardSteerTarget();
+        }
       }
 
       if (key === 'arrowup' || key === 'w') { e.preventDefault(); stateRef.current.accelInput = true; }
@@ -218,12 +301,14 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     const handleKeyUp = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
       
-      if (settings.steeringMode === 'keyboard') {
-        if ((key === 'arrowleft' || key === 'a') && stateRef.current.steerInput < 0) {
-          stateRef.current.steerInput = 0;
+      if (stateRef.current.steeringMode === 'keyboard') {
+        if (key === 'arrowleft' || key === 'a') {
+          stateRef.current.keySteerLeft = false;
+          updateKeyboardSteerTarget();
         }
-        if ((key === 'arrowright' || key === 'd') && stateRef.current.steerInput > 0) {
-          stateRef.current.steerInput = 0;
+        if (key === 'arrowright' || key === 'd') {
+          stateRef.current.keySteerRight = false;
+          updateKeyboardSteerTarget();
         }
       }
 
@@ -237,7 +322,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [settings.steeringMode, uiState.isFirstInteractionRequired]);
+  }, [uiState.isFirstInteractionRequired]);
 
   // Generate the recursive track with variable scenery climates
   const buildTrack = () => {
@@ -370,11 +455,12 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     const segmentsCount = stateRef.current.totalSegmentsCount;
     if (segmentsCount === 0) return;
 
-    // Spawn 45 AI cars distributed across the track
-    for (let i = 0; i < 45; i++) {
-      const zPos = 1500 + i * (segmentsCount * ROAD_SEGMENT_LENGTH / 48);
+    // Spawn 48 AI cars distributed across the track. The spacing keeps the first
+    // seconds playable while still giving enough overtaking opportunities.
+    for (let i = 0; i < 48; i++) {
+      const zPos = 1800 + i * (segmentsCount * ROAD_SEGMENT_LENGTH / 50);
       const laneId = Math.floor(Math.random() * 3) - 1; // -1, 0, 1 -> maps to offset -0.6, 0.0, 0.6
-      const speedKmh = 110 + Math.random() * 120; // 110 to 230 km/h
+      const speedKmh = 95 + Math.random() * 135; // 95 to 230 km/h
 
       const types: Array<'blue' | 'yellow' | 'green' | 'ambulance' | 'truck'> = ['blue', 'yellow', 'green', 'truck'];
       // Flashing ambulance speed runner
@@ -388,7 +474,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         width: selectedType === 'truck' ? 1.4 : 1.0,
         length: selectedType === 'truck' ? 150 : 100,
         color: selectedType === 'ambulance' ? '#ef4444' : selectedType === 'blue' ? '#3b82f6' : '#eab308',
-        laneChangeTimer: 50 + Math.random() * 150,
+        laneChangeTimer: 2.5 + Math.random() * 4.5,
         laneTarget: laneId * 0.61,
         isPassing: false
       });
@@ -762,6 +848,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
 
     let lastTime = performance.now();
     let animationStep = 0;
+    let lastCountdownText = '3';
 
     const gameTick = (highResTime: number) => {
       if (!stateRef.current.running) return;
@@ -778,7 +865,8 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
           audio.playChime();
         } else {
           const displayStr = countdownInt.toString();
-          if (uiState.countdownText !== displayStr) {
+          if (lastCountdownText !== displayStr) {
+            lastCountdownText = displayStr;
             setUiState(prev => ({ ...prev, countdownText: displayStr }));
           }
         }
@@ -803,21 +891,19 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     const s = stateRef.current;
 
     // Tick invincibility and recovery timers
-    if (s.invincibilityTimer > 0) s.invincibilityTimer -= dt;
+    if (s.invincibilityTimer > 0) s.invincibilityTimer = Math.max(s.invincibilityTimer - dt, 0);
     if (s.crashAnimationTimer > 0) {
       s.crashAnimationTimer -= dt;
       if (s.crashAnimationTimer <= 0) {
         s.isCrashActive = false;
-        s.invincibilityTimer = 2.0; // protective shield upon recovery
+        s.invincibilityTimer = 1.6; // protective shield upon recovery
       }
     }
 
     if (s.isCountingDown) return; // Freeze players until countdown clears
 
-    // Speed limits & drag coefficient equations
-    const maxLowGearSpeed = 200.0;
-    const maxHighGearSpeed = 450.0;
-    const maxSpeed = s.gear === 'LOW' ? maxLowGearSpeed : maxHighGearSpeed;
+    const previousPlayerZ = s.playerZ;
+    const maxSpeed = s.gear === 'LOW' ? LOW_GEAR_TOP_SPEED : HIGH_GEAR_TOP_SPEED;
 
     // Handle Time Tock
     s.timeLimit -= dt;
@@ -828,55 +914,65 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       return;
     }
 
-    // Accelerating logic
-    if (!s.isCrashActive) {
-      if (s.accelInput) {
-        // Shifting too early bogs down engine and limits acceleration rate (RPM drops)
-        let accelFactor = s.gear === 'LOW' ? 220 : 160;
-        if (s.gear === 'HIGH' && s.speed < 120) {
-          accelFactor = 45; // lugging penalty!
-        }
-        s.speed += accelFactor * dt;
-      } else if (s.brakeInput) {
-        s.speed -= 350.0 * dt; // solid hydraulic braking
-      } else {
-        s.speed -= 45 * dt; // natural drag friction
-      }
+    // A lightweight arcade drivetrain: torque fades near redline, high gear lugs
+    // under ~125 km/h, and drag is always applied so lift-off feels natural.
+    if (s.isCrashActive) {
+      s.speed -= 260 * dt;
+      s.targetSteerInput = 0;
     } else {
-      // Spinning out decays speed to zero
-      s.speed -= 180 * dt;
+      const speedRatio = clamp(s.speed / maxSpeed, 0, 1);
+      let acceleration = 0;
+
+      if (s.accelInput && !s.brakeInput) {
+        const basePower = s.gear === 'LOW' ? 255 : 190;
+        const torqueCurve = clamp(1.0 - 0.62 * speedRatio * speedRatio, 0.22, 1.0);
+        const lugPenalty = s.gear === 'HIGH' && s.speed < 125 ? 0.34 : 1.0;
+        acceleration += basePower * torqueCurve * lugPenalty;
+      }
+
+      if (s.brakeInput) {
+        acceleration -= 470 + s.speed * 0.18;
+      } else if (!s.accelInput) {
+        acceleration -= 24 + s.speed * 0.055;
+      }
+
+      const aeroDrag = 10 + s.speed * s.speed * 0.00034;
+      s.speed += (acceleration - aeroDrag) * dt;
     }
 
-    // Lane boundaries drift deceleration! (If driving off shoulder grass)
-    const onGrass = s.playerX < -1.0 || s.playerX > 1.0;
-    if (onGrass && !s.isCrashActive) {
-      s.speed -= 180 * dt; // massive friction deceleration
-      
-      // Screen jitter and shake
-      s.playerX += (Math.random() * 0.04 - 0.02);
-      
-      // Grass debris particles
-      if (Math.random() < 0.25) {
-        audio.playScreech(0.4);
-        spawnSpinDebris(s.playerX > 0 ? 0.95 : -0.95, '#15803d');
+    // Map current active segment to find track curves and hills
+    const activeSegmentIdxBeforeMove = Math.floor(s.playerZ / ROAD_SEGMENT_LENGTH) % s.roadSegments.length;
+    const currentSegmentBeforeMove = s.roadSegments[activeSegmentIdxBeforeMove];
+
+    // Lane boundaries drift deceleration. Rumbles are recoverable; deep shoulder
+    // driving rapidly bleeds speed and lateral grip without random teleport jitter.
+    const offRoadDepth = Math.max(Math.abs(s.playerX) - ROAD_EDGE, 0);
+    const onShoulder = offRoadDepth > 0;
+    if (onShoulder && !s.isCrashActive) {
+      const shoulderSeverity = clamp(offRoadDepth / 0.9, 0, 1);
+      s.speed -= (120 + 240 * shoulderSeverity) * dt;
+      s.lateralVelocity *= Math.exp(-dt * (2.4 + shoulderSeverity * 4.5));
+
+      if (Math.random() < 0.18 + shoulderSeverity * 0.22) {
+        audio.playScreech(0.25 + shoulderSeverity * 0.25);
+        spawnSpinDebris(s.playerX > 0 ? 0.95 : -0.95, currentSegmentBeforeMove?.climate === 'snow' ? '#e2e8f0' : '#15803d');
       }
     }
 
     // Clamp absolute bounds
-    s.speed = Math.max(Math.min(s.speed, maxSpeed), 0);
+    s.speed = clamp(s.speed, 0, maxSpeed);
     if (s.speed > s.maxSpeedAchieved) s.maxSpeedAchieved = Math.round(s.speed);
 
     // Compute synthetic engine RPM (for pitch modulation)
     if (s.gear === 'LOW') {
-      s.rpm = s.speed / maxLowGearSpeed;
+      s.rpm = clamp(s.speed / LOW_GEAR_TOP_SPEED, 0, 1);
     } else {
-      s.rpm = Math.max((s.speed - 90) / (maxHighGearSpeed - 90), 0);
+      s.rpm = clamp((s.speed - 95) / (HIGH_GEAR_TOP_SPEED - 95), 0, 1);
     }
     audio.setEngineSound(s.speed, s.gear, s.rpm);
 
     // Player position Z physics
-    // Convert speed in km/h to world meters/second (approx)
-    const speedMs = (s.speed / 3.6) * 5.0;
+    const speedMs = (s.speed / 3.6) * SPEED_TO_WORLD_MULTIPLIER;
     s.playerZ += speedMs * dt;
     s.totalDistanceDriven += speedMs * dt * 0.01;
 
@@ -886,61 +982,82 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       s.lapCompleted++;
     }
 
-    // Map current active segment to find track curves and hills
     const activeSegmentIdx = Math.floor(s.playerZ / ROAD_SEGMENT_LENGTH) % s.roadSegments.length;
     const currentSegment = s.roadSegments[activeSegmentIdx];
-    
-    // Dynamic camera steering tilt
-    if (!s.isCrashActive) {
-      // Centrifugal horizontal pull around curves
-      const curvePullFactor = currentSegment.curve * 0.5 * (s.speed / maxHighGearSpeed);
-      s.playerX -= curvePullFactor * dt;
 
-      // Handle controller steering
-      const baseSteer = settings.steeringMode === 'keyboard' ? 1.0 : 3.8;
-      const steerFactor = baseSteer * (s.speed > 30 ? 1.0 : Math.max(0.1, s.speed / 30)); // scale sensitivity by speed
-      s.playerX += s.steerInput * steerFactor * dt;
-      s.playerX = Math.min(Math.max(s.playerX, -2.0), 2.0); // allow slight off-road exploration
+    // Handling model: raw controls are smoothed, converted into lateral
+    // acceleration, then filtered through grip. This gives the car weight.
+    if (!s.isCrashActive) {
+      const steerResponse = s.steeringMode === 'tilt' ? 7.5 : 11.5;
+      s.steerInput = approach(s.steerInput, s.targetSteerInput, steerResponse * dt);
+
+      const speed01 = clamp(s.speed / HIGH_GEAR_TOP_SPEED, 0, 1);
+      const baseGrip = roadGripForSegment(currentSegment);
+      const shoulderGrip = onShoulder ? clamp(1.0 - offRoadDepth * 0.35, 0.48, 1.0) : 1.0;
+      const grip = baseGrip * shoulderGrip;
+
+      const steeringAuthority = (1.15 + speed01 * 2.15) * grip;
+      const curvePull = currentSegment.curve * (0.18 + speed01 * 0.72);
+      const counterSteerAssist = clamp(-curvePull * 0.18, -0.35, 0.35);
+      const lateralAcceleration = (s.steerInput * steeringAuthority + counterSteerAssist - curvePull) * grip;
+
+      s.lateralVelocity += lateralAcceleration * dt;
+
+      // Lower speed should settle quickly; high speed should keep some momentum.
+      const lateralDamping = (3.9 - speed01 * 1.55) * grip;
+      s.lateralVelocity *= Math.exp(-dt * lateralDamping);
+      s.playerX += s.lateralVelocity * dt;
+
+      if (Math.abs(s.playerX) > HARD_SHOULDER_EDGE) {
+        s.playerX = clamp(s.playerX, -HARD_SHOULDER_EDGE, HARD_SHOULDER_EDGE);
+        s.lateralVelocity *= -0.22;
+        s.speed *= 0.88;
+        audio.playScreech(0.55);
+      }
+    } else {
+      // Let the crash spin slide a little instead of instantly freezing the lane.
+      s.steerInput = approach(s.steerInput, 0, 8 * dt);
+      s.lateralVelocity *= Math.exp(-dt * 2.8);
+      s.playerX = clamp(s.playerX + s.lateralVelocity * dt, -HARD_SHOULDER_EDGE, HARD_SHOULDER_EDGE);
     }
 
-    // Stage progression tracker
-    const segmentsStageCount = 400; // Average stage length
-    const currentStageIdx = Math.min(Math.floor(activeSegmentIdx / segmentsStageCount), SCENERY_STAGES.length - 1);
-    
-    if (s.currentStageIdx !== currentStageIdx) {
-      // Crossed stage boundary! Play milestone checkpoint sound and reward surplus survival time
-      s.currentStageIdx = currentStageIdx;
-      s.timeLimit = Math.min(s.timeLimit + 30.0, 99.0); // max 99 seconds
+    // Stage progression tracker. The original used a fixed 400-segment stage
+    // width even though the stages have different lengths, which made the HUD
+    // and time bonuses fire at the wrong places.
+    const stageInfo = getStageInfo(activeSegmentIdx);
+    if (s.currentStageIdx !== stageInfo.stageIdx) {
+      s.currentStageIdx = stageInfo.stageIdx;
+      s.timeLimit = Math.min(s.timeLimit + 28.0, 99.0);
       audio.playChime();
-      
-      // Temporary big alert in UI
       setUiState(prev => ({ ...prev, nearMissScoreAlert: 5000 }));
       s.score += 5000;
       setTimeout(() => setUiState(prev => ({ ...prev, nearMissScoreAlert: 0 })), 2500);
     }
+    s.stageProgress = stageInfo.progress;
 
-    s.stageProgress = (activeSegmentIdx % segmentsStageCount) / segmentsStageCount;
-
-    // Update Score incrementally as you drive
+    // Update Score incrementally as you drive. High gear gives a modest risk bonus.
     if (s.speed > 10) {
-      s.score += Math.round((s.speed / 50) * (s.gear === 'HIGH' ? 2 : 1) * dt * 10);
+      s.score += Math.round((s.speed / 55) * (s.gear === 'HIGH' ? 1.65 : 1.0) * dt * 10);
     }
 
     // Update dynamic particles
     updateParticles(dt);
 
     // AI Car Physics & Logic
-    updateAiCars(dt, activeSegmentIdx, totalLength);
+    updateAiCars(dt, activeSegmentIdx, totalLength, previousPlayerZ);
 
-    // Synchronize to UI state with throttle
-    if (Math.round(s.playerZ) % 4 === 0) {
+    // Synchronize to UI state at a stable rate instead of using position modulo,
+    // which could skip updates at high speed or flood updates at low speed.
+    s.uiUpdateTimer += dt;
+    if (s.uiUpdateTimer >= 1 / 12) {
+      s.uiUpdateTimer = 0;
       setUiState(prev => ({
         ...prev,
         speed: Math.round(s.speed),
         gear: s.gear,
         rpm: Math.round(s.rpm * 100),
         score: s.score,
-        time: Math.round(s.timeLimit),
+        time: Math.ceil(s.timeLimit),
         stageName: SCENERY_STAGES[s.currentStageIdx].name,
         stageIdx: s.currentStageIdx,
         stageProgressPct: Math.round(s.stageProgress * 100)
@@ -961,14 +1078,13 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     });
   };
 
-  const updateAiCars = (dt: number, activeSegmentIdx: number, totalLength: number) => {
+  const updateAiCars = (dt: number, _activeSegmentIdx: number, totalLength: number, previousPlayerZ: number) => {
     const s = stateRef.current;
-    const playerSegmentZ = s.playerZ;
+    const playerZ = s.playerZ;
 
     s.activeCars.forEach(car => {
-      // Move AI car along Z
       const carPrevZ = car.z;
-      const speedMs = (car.speed / 3.6) * 5.0;
+      const speedMs = (car.speed / 3.6) * SPEED_TO_WORLD_MULTIPLIER;
       car.z += speedMs * dt;
 
       // Handle wrapping at end of track
@@ -976,60 +1092,64 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         car.z -= totalLength;
       }
 
-      // Simple AI Lane-Changing behavior to bypass slower speed blocks
+      // Lane changes are measured in seconds, not world units. Keep them
+      // occasional and avoid surprise swerves right on top of the player.
+      let relZ = normalizeRelativeZ(car.z - playerZ, totalLength);
       car.laneChangeTimer -= dt;
       if (car.laneChangeTimer <= 0) {
-        car.laneChangeTimer = 100 + Math.random() * 200;
-        const newLane = Math.floor(Math.random() * 3) - 1; // -1, 0, 1
-        car.laneTarget = newLane * 0.61;
-      }
-
-      // Smooth lane interpolations
-      if (car.offset !== car.laneTarget) {
-        const offsetDelta = car.laneTarget - car.offset;
-        car.offset += Math.sign(offsetDelta) * 0.3 * dt;
-        if (Math.abs(car.offset - car.laneTarget) < 0.05) {
-          car.offset = car.laneTarget;
+        car.laneChangeTimer = 2.2 + Math.random() * 5.5;
+        const playerNearby = relZ > -160 && relZ < 260;
+        if (!playerNearby) {
+          const newLane = Math.floor(Math.random() * 3) - 1; // -1, 0, 1
+          car.laneTarget = newLane * 0.61;
         }
       }
 
-      // Determine proximity and coordinate safety checks with player
-      // We look at Z distance relative to player Camera
-      let relZ = car.z - playerSegmentZ;
-      
-      // Account for path loops wrap
-      if (relZ < -totalLength / 2) relZ += totalLength;
-      if (relZ > totalLength / 2) relZ -= totalLength;
-
-      // Collisions check!
-      // Collision happens if Z distance is very small (car length overlap) and X spans match
-      const zOverlap = Math.abs(relZ) < 35; // overlap window
-      const xOverlap = Math.abs(car.offset - s.playerX) < 0.35; // width bounds
-
-      if (zOverlap && xOverlap && !s.isCrashActive && s.invincibilityTimer <= 0) {
-        // BOOM! Trigger severe crash spin-out
-        s.isCrashActive = true;
-        s.crashAnimationTimer = 1.0; // 1 second of spinning control loss
-        s.speed = 10.0; // reset speed
-        audio.playCrash();
-        spawnSpinDebris(s.playerX, '#f43f5e'); // fiery red sparks
+      // Smooth lane interpolations with overshoot protection.
+      if (car.offset !== car.laneTarget) {
+        const offsetDelta = car.laneTarget - car.offset;
+        const laneStep = 0.55 * dt;
+        if (Math.abs(offsetDelta) <= laneStep) {
+          car.offset = car.laneTarget;
+        } else {
+          car.offset += Math.sign(offsetDelta) * laneStep;
+        }
       }
 
-      // Check for authentic, nail-biting NEAR-MISS overtaking bonus!
-      // If player passes very closely to an AI car without crashing
-      const isOvertakingInZ = relZ < 20 && relZ > -20;
-      const pathPassingSpeed = s.speed > car.speed;
-      
-      if (isOvertakingInZ && pathPassingSpeed && !car.isPassing && !s.isCrashActive) {
-        const lateralDistance = Math.abs(car.offset - s.playerX);
-        if (lateralDistance > 0.30 && lateralDistance < 0.55) {
-          car.isPassing = true; // flag to avoid multiple ticking
+      relZ = normalizeRelativeZ(car.z - playerZ, totalLength);
+      const prevRelZ = normalizeRelativeZ(carPrevZ - previousPlayerZ, totalLength);
+
+      // Swept collision: at 300+ km/h a single frame can skip a small overlap
+      // window, so detect sign-crossing as well as immediate overlap.
+      const sweptAcrossPlayer = (prevRelZ > 0 && relZ <= 0) || (prevRelZ < 0 && relZ >= 0 && car.speed > s.speed);
+      const zOverlap = Math.min(Math.abs(relZ), Math.abs(prevRelZ)) < 45 || sweptAcrossPlayer;
+      const xCollisionLimit = 0.25 + car.width * 0.15;
+      const lateralDistance = Math.abs(car.offset - s.playerX);
+      const xOverlap = lateralDistance < xCollisionLimit;
+
+      if (zOverlap && xOverlap && !s.isCrashActive && s.invincibilityTimer <= 0) {
+        s.isCrashActive = true;
+        s.crashAnimationTimer = 1.05;
+        s.speed = Math.max(18, s.speed * 0.18);
+        s.lateralVelocity += (s.playerX < car.offset ? -1 : 1) * 1.6;
+        audio.playCrash();
+        spawnSpinDebris(s.playerX, '#f43f5e');
+      }
+
+      // Near miss bonuses should trigger on the actual pass moment, not for
+      // multiple frames in the overlap window. Trucks need more clearance.
+      const passedCar = prevRelZ > 0 && relZ <= 0;
+      const pathPassingSpeed = s.speed > car.speed + 8;
+      const nearMissMin = xCollisionLimit + 0.04;
+      const nearMissMax = xCollisionLimit + 0.30;
+      if (passedCar && pathPassingSpeed && !car.isPassing && !s.isCrashActive) {
+        if (lateralDistance >= nearMissMin && lateralDistance <= nearMissMax) {
+          car.isPassing = true;
           s.nearMissCount++;
-          
-          // SpeedHQ Overtake Bonus score chime!
-          const passBonus = car.spriteType === 'ambulance' ? 3000 : 1000;
+
+          const passBonus = car.spriteType === 'ambulance' ? 3000 : car.spriteType === 'truck' ? 1500 : 1000;
           s.score += passBonus;
-          audio.playScreech(0.6);
+          audio.playScreech(0.45);
 
           setUiState(prev => ({ ...prev, nearMissScoreAlert: passBonus }));
           setTimeout(() => setUiState(prev => ({ ...prev, nearMissScoreAlert: 0 })), 1500);
@@ -1037,20 +1157,21 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       }
 
       // Reset pass tracker once distant
-      if (Math.abs(relZ) > 350) {
+      if (Math.abs(relZ) > 380) {
         car.isPassing = false;
       }
     });
 
-    // Handle background particles flow (Speed dust particles flying backwards)
-    if (s.speed > 60 && Math.random() < 0.15) {
-      const pColor = s.currentStageIdx === 4 ? '#cbd5e1' : 'rgba(255,255,255,0.7)'; // white snow dust or standard velocity lines
+    // Handle background particles flow (speed dust particles flying backwards).
+    // Scale by dt so high-refresh displays do not spawn twice as much dust.
+    if (s.speed > 60 && Math.random() < dt * 9.0) {
+      const pColor = s.currentStageIdx === 4 ? '#cbd5e1' : 'rgba(255,255,255,0.7)';
       const dustX = Math.random() * 2 - 1;
       s.particles.push({
         x: dustX,
         y: -1 + Math.random() * 1.5,
         vx: -s.steerInput * 4.0,
-        vy: (s.speed / 80) * 4.0, // scale vertical eject by speed
+        vy: (s.speed / 80) * 4.0,
         color: pColor,
         alpha: 0.8,
         life: 0.8,
@@ -1079,6 +1200,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
   const drawFrame = (ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, stepNum: number) => {
     const s = stateRef.current;
     const startZ = s.playerZ;
+    const totalLength = s.roadSegments.length * ROAD_SEGMENT_LENGTH;
 
     // Refresh backdrop using climate-specific colors
     const climateStage = SCENERY_STAGES[s.currentStageIdx];
@@ -1192,7 +1314,9 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         const carSegmentIdx = Math.floor(car.z / ROAD_SEGMENT_LENGTH) % s.roadSegments.length;
         if (carSegmentIdx === seg.index) {
           // Calculate project position
-          const relZ = car.z - startZ;
+          const relZ = normalizeRelativeZ(car.z - startZ, totalLength);
+          if (relZ <= DISTANCE_TO_PLAYER || relZ >= VIEW_DEPTH * ROAD_SEGMENT_LENGTH) return;
+
           const scale = CAMERA_DEPTH / relZ;
           
           let carAccumCurve = 0;
@@ -1211,9 +1335,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
           
           const size = Math.round(carScreenW * 0.14);
 
-          if (relZ > DISTANCE_TO_PLAYER && relZ < VIEW_DEPTH * ROAD_SEGMENT_LENGTH) {
-            drawAiCar(ctx, car, carScreenX, carScreenY, size);
-          }
+          drawAiCar(ctx, car, carScreenX, carScreenY, size);
         }
       });
     }
@@ -1430,11 +1552,13 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
   };
 
   const handleTouchLeft = (activate: boolean) => {
-    stateRef.current.steerInput = activate ? -1.0 : 0.0;
+    stateRef.current.touchSteerLeft = activate;
+    updateTouchSteerTarget();
   };
 
   const handleTouchRight = (activate: boolean) => {
-    stateRef.current.steerInput = activate ? 1.0 : 0.0;
+    stateRef.current.touchSteerRight = activate;
+    updateTouchSteerTarget();
   };
 
   const handleStartButton = () => {
@@ -1589,8 +1713,10 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
                   id="virtual-steer-left-btn"
                   onTouchStart={() => handleTouchLeft(true)}
                   onTouchEnd={() => handleTouchLeft(false)}
+                  onTouchCancel={() => handleTouchLeft(false)}
                   onMouseDown={() => handleTouchLeft(true)}
                   onMouseUp={() => handleTouchLeft(false)}
+                  onMouseLeave={() => handleTouchLeft(false)}
                   className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900/80 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl transition-colors cursor-pointer outline-none select-none"
                 >
                   ◀
@@ -1599,8 +1725,10 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
                   id="virtual-steer-right-btn"
                   onTouchStart={() => handleTouchRight(true)}
                   onTouchEnd={() => handleTouchRight(false)}
+                  onTouchCancel={() => handleTouchRight(false)}
                   onMouseDown={() => handleTouchRight(true)}
                   onMouseUp={() => handleTouchRight(false)}
+                  onMouseLeave={() => handleTouchRight(false)}
                   className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900/80 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl transition-colors cursor-pointer outline-none select-none"
                 >
                   ▶
@@ -1635,8 +1763,10 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
                 id="virtual-brake-btn"
                 onTouchStart={() => { stateRef.current.brakeInput = true; }}
                 onTouchEnd={() => { stateRef.current.brakeInput = false; }}
+                onTouchCancel={() => { stateRef.current.brakeInput = false; }}
                 onMouseDown={() => { stateRef.current.brakeInput = true; }}
                 onMouseUp={() => { stateRef.current.brakeInput = false; }}
+                onMouseLeave={() => { stateRef.current.brakeInput = false; }}
                 className="w-16 h-20 rounded-t-lg bg-orange-600 border-2 border-orange-500/30 text-white flex flex-col items-center justify-center transition-colors font-black text-xs shadow-lg active:bg-orange-500 cursor-pointer select-none"
               >
                 <ArrowDown className="w-5 h-5 mb-1" />
@@ -1646,8 +1776,10 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
                 id="virtual-accel-btn"
                 onTouchStart={() => { stateRef.current.accelInput = true; }}
                 onTouchEnd={() => { stateRef.current.accelInput = false; }}
+                onTouchCancel={() => { stateRef.current.accelInput = false; }}
                 onMouseDown={() => { stateRef.current.accelInput = true; }}
                 onMouseUp={() => { stateRef.current.accelInput = false; }}
+                onMouseLeave={() => { stateRef.current.accelInput = false; }}
                 className="w-16 h-24 rounded-t-lg bg-emerald-600 border-2 border-emerald-500/30 text-white flex flex-col items-center justify-center transition-colors font-black text-xs shadow-xl active:bg-emerald-500 cursor-pointer select-none"
               >
                 <ArrowUp className="w-6 h-6 mb-1 text-emerald-200" />
@@ -1674,7 +1806,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
           <div className="w-full h-1 bg-slate-900 rounded-full mt-2 overflow-hidden">
             <div 
               className="h-full bg-cyan-400 transition-all duration-75"
-              style={{ width: `${Math.min((uiState.speed / 312) * 100, 100)}%` }}
+              style={{ width: `${Math.min((uiState.speed / HIGH_GEAR_TOP_SPEED) * 100, 100)}%` }}
             />
           </div>
         </div>
