@@ -5,8 +5,24 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { audio } from '../lib/AudioEngine';
-import { PlayerSettings, RoadSegment, GameCar, Particle, ActiveScenery } from '../types';
-import { Sliders, RotateCcw, Volume2, VolumeX, ShieldAlert, Zap, Radio, Phone, Compass, ArrowUp, ArrowDown, ChevronRight } from 'lucide-react';
+import {
+  clamp,
+  approach,
+  normalizeRelativeZ,
+  topSpeedForGear,
+  speedToWorldUnitsPerSec,
+  computeDrivetrainAcceleration,
+  computeLateralAcceleration,
+  detectCarCollision,
+  carCollisionHalfWidth,
+  kmhToMph,
+  LANE_SPACING,
+  COLLISION_Z_DEPTH,
+  LOW_GEAR_TOP_SPEED,
+  HIGH_GEAR_TOP_SPEED,
+} from '../lib/physics';
+import { PlayerSettings, RoadSegment, GameCar, Particle, ActiveScenery, RoadSprite } from '../types';
+import { Sliders, RotateCcw, Volume2, VolumeX, ShieldAlert, Zap, Radio, Phone, Compass, ArrowUp, ArrowDown, ChevronRight, Maximize2, Minimize2 } from 'lucide-react';
 
 interface GameCanvasProps {
   settings: PlayerSettings;
@@ -21,41 +37,61 @@ const ROAD_SEGMENT_LENGTH = 200; // world units per segment
 const ROAD_WIDTH = 2000;         // road width (world units)
 const VIEW_DEPTH = 30;           // number of segments to draw forward
 const CAMERA_HEIGHT = 1000;      // camera vertical height above road
-const DISTANCE_TO_PLAYER = 150;  // player distance from camera along Z
+const DISTANCE_TO_PLAYER = 150;  // near road cull: segments closer than this are skipped
 const CAMERA_DEPTH = 0.8;        // perspective fov multiplier
 const LANE_COUNT = 3;
 
-// Tuned handling model constants. The original game moved the car directly
-// sideways from input, which made the controls feel twitchy at low speeds and
-// imprecise at high speeds. These constants give the car inertia, grip, drag,
-// and a readable arcade top speed while preserving the pseudo-3D render style.
-const LOW_GEAR_TOP_SPEED = 195.0;
-const HIGH_GEAR_TOP_SPEED = 385.0;
-const SPEED_TO_WORLD_MULTIPLIER = 5.0;
+// The player car sprite is drawn at this fraction of the canvas height.
+const PLAYER_SPRITE_Y_FRACTION = 0.78;
+// ...which means it visually sits at this camera-relative Z on the road. A flat
+// road point projects to screenY/H = 0.5 * (1 + CAMERA_HEIGHT*CAMERA_DEPTH/relZ),
+// so solving for relZ at the sprite's Y gives where the player car *appears* to
+// be. Collisions must be resolved here (not at DISTANCE_TO_PLAYER, which lands
+// well below the visible road) so a crash always lines up with a car you can see.
+const PLAYER_CAR_ROAD_Z =
+  (CAMERA_HEIGHT * CAMERA_DEPTH) / (2 * PLAYER_SPRITE_Y_FRACTION - 1);
+
+// Lateral road-space bounds used when clamping the player's position. The
+// drivetrain, steering, and collision math now live in ../lib/physics so they
+// can be unit tested without a canvas or animation loop.
 const ROAD_EDGE = 0.98;
 const HARD_SHOULDER_EDGE = 2.0;
 
-const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
-const approach = (value: number, target: number, maxDelta: number) => {
-  if (value < target) return Math.min(value + maxDelta, target);
-  if (value > target) return Math.max(value - maxDelta, target);
-  return value;
-};
+type AliefTrafficCar =
+  | 'acura_integra'
+  | 'ford_tempo'
+  | 'mr2_86'
+  | 'pontiac_fiero'
+  | 'ford_probe'
+  | 'ambulance'
+  | 'truck';
 
-const normalizeRelativeZ = (relativeZ: number, totalLength: number) => {
-  if (relativeZ < -totalLength / 2) return relativeZ + totalLength;
-  if (relativeZ > totalLength / 2) return relativeZ - totalLength;
-  return relativeZ;
+const ALIEF_TRAFFIC_MODELS: AliefTrafficCar[] = [
+  'acura_integra',
+  'ford_tempo',
+  'mr2_86',
+  'pontiac_fiero',
+  'ford_probe'
+];
+
+const TRAFFIC_CAR_COLORS: Record<AliefTrafficCar, string> = {
+  acura_integra: '#ef4444',
+  ford_tempo: '#d6d3d1',
+  mr2_86: '#f8fafc',
+  pontiac_fiero: '#f97316',
+  ford_probe: '#2563eb',
+  ambulance: '#ef4444',
+  truck: '#334155'
 };
 
 // Map out the continuous looping stage segments
 const SCENERY_STAGES: ActiveScenery[] = [
-  { name: "1. COCONUT COAST", climate: 'cost', bgColor: '#021526', accentColor: '#0ea5e9', length: 400 },
-  { name: "2. NEON METROPOLIS", climate: 'city', bgColor: '#090514', accentColor: '#ec4899', length: 500 },
-  { name: "3. CRYPTIC TUNNEL", climate: 'tunnel', bgColor: '#060a0f', accentColor: '#eab308', length: 300 },
-  { name: "4. DESERT DUNES", climate: 'desert', bgColor: '#1c0f05', accentColor: '#f97316', length: 450 },
-  { name: "5. BLIZZARD PASS", climate: 'snow', bgColor: '#071624', accentColor: '#a5f3fc', length: 450 }
+  { name: "1. ALIEF NIGHT CRUISE", climate: 'city', bgColor: '#07111f', accentColor: '#38bdf8', length: 360 },
+  { name: "2. BELLAIRE BLVD RUN", climate: 'city', bgColor: '#0b1020', accentColor: '#f59e0b', length: 430 },
+  { name: "3. ELSIK HIGH SCHOOL", climate: 'city', bgColor: '#081624', accentColor: '#60a5fa', length: 360 },
+  { name: "4. HIGH STAR DR SPRINT", climate: 'tunnel', bgColor: '#06131f', accentColor: '#22c55e', length: 330 },
+  { name: "5. WESTPARK TOLLWAY DASH", climate: 'city', bgColor: '#030712', accentColor: '#ec4899', length: 420 }
 ];
 
 const STAGE_BOUNDARIES = SCENERY_STAGES.reduce<Array<{ start: number; end: number }>>((bounds, stage) => {
@@ -120,14 +156,31 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     particles: [] as Particle[],
 
     // Calibration
-    flatGamma: 0,            // calibrated horizontal balance
+    flatRoll: 0,             // calibrated baseline of the steering-roll axis
     tiltValue: 0,            // live calculated relative tilt value
     steeringMode: settings.steeringMode, // cached steering mode for closures
 
     // Stats
     nearMissCount: 0,
     totalDistanceDriven: 0,
-    uiUpdateTimer: 0
+    uiUpdateTimer: 0,
+
+    // Debug: when showDebug is on, a collision freezes the loop (paused) so the
+    // readout can be inspected; the Resume button clears it. Off by default for
+    // normal play — the DEBUG button re-enables it.
+    paused: false,
+    showDebug: false,
+
+    // Collision debug snapshot (nearest traffic car, relative to the player car)
+    debug: {
+      nearestRelZ: 0,
+      nearestCamZ: 0,     // camera-relative Z; visible road is roughly 800..6000
+      nearestLateral: 0,
+      nearestHalfWidth: 0,
+      nearestType: '',
+      nearestInLane: false,
+      lastHitRelZ: 0
+    }
   });
 
   const [uiState, setUiState] = useState({
@@ -136,7 +189,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     rpm: 0,
     score: 0,
     time: 80,
-    stageName: '1. COCONUT COAST',
+    stageName: '1. ALIEF NIGHT CRUISE',
     stageIdx: 0,
     stageProgressPct: 0,
     nearMissScoreAlert: 0, // transient points indicator
@@ -144,8 +197,61 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     tiltAvailable: false,
     tiltPermissionStatus: 'unknown' as 'unknown' | 'granted' | 'denied',
     isFirstInteractionRequired: true,
-    showControlsHelp: true
+    showControlsHelp: true,
+    showDebug: false,
+    paused: false,
+    isPortrait: false,
+    isFullscreen: false,
+    musicTrackIndex: 0,
+    debug: {
+      nearestRelZ: 0,
+      nearestCamZ: 0,
+      nearestLateral: 0,
+      nearestHalfWidth: 0,
+      nearestType: '',
+      nearestInLane: false,
+      lastHitRelZ: 0
+    }
   });
+
+  // Track portrait vs landscape so tilt mode can prompt for a wide hold.
+  useEffect(() => {
+    const checkAspect = () =>
+      setUiState(prev => ({ ...prev, isPortrait: window.innerHeight > window.innerWidth }));
+    checkAspect();
+    window.addEventListener('resize', checkAspect);
+    window.addEventListener('orientationchange', checkAspect);
+    return () => {
+      window.removeEventListener('resize', checkAspect);
+      window.removeEventListener('orientationchange', checkAspect);
+    };
+  }, []);
+
+  // Track fullscreen state so the toggle button shows the right icon (the user
+  // can also leave fullscreen via the system back gesture / Esc).
+  useEffect(() => {
+    const sync = () =>
+      setUiState(prev => ({
+        ...prev,
+        isFullscreen: !!(document.fullscreenElement || (document as any).webkitFullscreenElement),
+      }));
+    document.addEventListener('fullscreenchange', sync);
+    document.addEventListener('webkitfullscreenchange', sync);
+    sync();
+    return () => {
+      document.removeEventListener('fullscreenchange', sync);
+      document.removeEventListener('webkitfullscreenchange', sync);
+    };
+  }, []);
+
+  // Apply audio settings to the engine whenever they change (also wires up the
+  // BGM/FX toggles, which previously updated state but never reached the audio).
+  useEffect(() => {
+    audio.setMusicEnabled(settings.musicEnabled);
+    audio.setSoundsEnabled(settings.soundEnabled);
+    audio.setMusicVolume(settings.musicVolume);
+    audio.setSfxVolume(settings.sfxVolume);
+  }, [settings.musicEnabled, settings.soundEnabled, settings.musicVolume, settings.sfxVolume]);
 
   // Handle device orientation permissions dynamically
   useEffect(() => {
@@ -171,13 +277,8 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
   useEffect(() => {
     // When settings change from parent, update mutable references that might be captured in old closures.
     // Reset held steering so switching modes never leaves the car pulling to one side.
-    const s = stateRef.current;
-    s.steeringMode = settings.steeringMode;
-    s.keySteerLeft = false;
-    s.keySteerRight = false;
-    s.touchSteerLeft = false;
-    s.touchSteerRight = false;
-    s.targetSteerInput = 0;
+    stateRef.current.steeringMode = settings.steeringMode;
+    clearSteeringHolds();
   }, [settings.steeringMode]);
 
   const requestTiltPermission = async () => {
@@ -204,16 +305,31 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
   };
 
   // Process Device Orientation events (tilt control)
+  // The "steering roll" axis depends on how the screen is oriented. In portrait
+  // it's gamma (left/right tilt); held in landscape — the racing pose — the
+  // device's beta axis becomes the left/right roll while gamma now tracks
+  // forward/back, which is the "steering hooked to forward/back" bug. Pick the
+  // axis (and sign) from the current screen orientation.
+  const readRollAngle = (e: DeviceOrientationEvent): number | null => {
+    const { beta, gamma } = e;
+    if (beta === null || gamma === null) return null;
+    const angle =
+      (typeof screen !== 'undefined' && screen.orientation && typeof screen.orientation.angle === 'number')
+        ? screen.orientation.angle
+        : (typeof (window as any).orientation === 'number' ? (window as any).orientation : 0);
+    if (angle === 90) return beta;            // landscape
+    if (angle === 270 || angle === -90) return -beta; // landscape, other way up
+    return gamma;                             // portrait (fallback)
+  };
+
   const handleOrientationEvent = (e: DeviceOrientationEvent) => {
     if (stateRef.current.steeringMode !== 'tilt') return;
-    if (!e.gamma && e.gamma !== 0) return;
 
-    // Convert roll (gamma) to steering factor based on landscape orientation (horizontal holding)
-    const baseGamma = e.gamma; // Range: -90 to +90
-    
-    // Compute steering steer factor
-    // If phone is tilted left or right, we scale roll to -1.0 -> +1.0
-    const difference = baseGamma - stateRef.current.flatGamma;
+    const roll = readRollAngle(e);
+    if (roll === null) return;
+
+    // Steering is the change in the roll axis from the calibrated flat baseline.
+    const difference = roll - stateRef.current.flatRoll;
     stateRef.current.tiltValue = difference;
 
     // Deadzone and sensitivity calculations
@@ -234,11 +350,12 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
   };
 
   const calibrateTilt = () => {
-    // Record baseline horizontal gamma
+    // Record the baseline of the current roll axis (matches handleOrientationEvent).
     if (window.DeviceOrientationEvent) {
       const captureFlat = (e: DeviceOrientationEvent) => {
-        if (e.gamma !== null) {
-          stateRef.current.flatGamma = e.gamma;
+        const roll = readRollAngle(e);
+        if (roll !== null) {
+          stateRef.current.flatRoll = roll;
           window.removeEventListener('deviceorientation', captureFlat);
           // Re-attach persistent orientation stream
           window.removeEventListener('deviceorientation', handleOrientationEvent);
@@ -257,6 +374,19 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
   const updateTouchSteerTarget = () => {
     const s = stateRef.current;
     s.targetSteerInput = (s.touchSteerRight ? 1 : 0) - (s.touchSteerLeft ? 1 : 0);
+  };
+
+  const clearSteeringHolds = () => {
+    const s = stateRef.current;
+    s.keySteerLeft = false;
+    s.keySteerRight = false;
+    s.touchSteerLeft = false;
+    s.touchSteerRight = false;
+    s.targetSteerInput = 0;
+    // Keep the smoothed input and sideways velocity from coasting after an
+    // alt-tab, browser focus loss, or pointer/touch cancellation.
+    s.steerInput = 0;
+    s.lateralVelocity = 0;
   };
 
   const roadGripForSegment = (segment?: RoadSegment) => {
@@ -316,100 +446,144 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       if (key === 'arrowdown' || key === 's') stateRef.current.brakeInput = false;
     };
 
+    const handleBlur = () => clearSteeringHolds();
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        clearSteeringHolds();
+        stateRef.current.accelInput = false;
+        stateRef.current.brakeInput = false;
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [uiState.isFirstInteractionRequired]);
 
-  // Generate the recursive track with variable scenery climates
+  // Generate the recursive track as a stylized Alief, TX night run.
+  // It is not a street-accurate map; it uses recognizable local flavor:
+  // Alief signs, Bellaire Blvd storefronts, High Star/Highstar Drive, and
+  // a big Elsik High School campus landmark.
   const buildTrack = () => {
     const segments: RoadSegment[] = [];
     let currentZ = 0;
     let index = 0;
 
-    SCENERY_STAGES.forEach((stage) => {
-      // Generate components for this scenery block
+    SCENERY_STAGES.forEach((stage, stageIdx) => {
       const stageLength = stage.length;
 
       for (let i = 0; i < stageLength; i++) {
-        // Curve frequency & amplitude variations matching climatic theme
         let segmentCurve = 0;
         let segmentHill = 0;
 
-        // Generate undulating road structures
-        if (stage.climate === 'cost') {
-          // Coast has long gentle winding curves and light coastal slopes
-          segmentCurve = Math.sin(i / 35) * 2.2;
-          segmentHill = Math.cos(i / 20) * 8.0;
-        } else if (stage.climate === 'city') {
-          // City has sharp turns at grid intervals
-          if ((i > 50 && i < 110) || (i > 200 && i < 270) || (i > 380 && i < 440)) {
-            segmentCurve = 4.5; // sharp right curve
-          } else {
-            segmentCurve = 0;
-          }
-          segmentHill = Math.sin(i / 15) * 4.0;
-        } else if (stage.climate === 'tunnel') {
-          // Tunnels are straight or slightly sweeping, flat roads
-          segmentCurve = Math.sin(i / 60) * 1.5;
-          segmentHill = -2.0; // gradual downhill entry
-        } else if (stage.climate === 'desert') {
-          // Desert has severe sand dunes (rollercoaster hills) but sparse curves
-          segmentCurve = Math.cos(i / 50) * 1.2;
-          segmentHill = Math.sin(i / 12) * 28.0; // Extreme hills!
-        } else if (stage.climate === 'snow') {
-          // Blizzard mountain pass has extremely erratic hairpins
-          segmentCurve = Math.sin(i / 18) * 5.2; // sharp hairpins
-          segmentHill = Math.sin(i / 25) * 15.0; // moderate hills
+        // Alief is mostly flat, so hills are intentionally subtle. The fun
+        // comes from sweeping boulevard curves, school-zone kinks, and traffic.
+        if (stageIdx === 0) {
+          // Neighborhood / Alief night cruise.
+          segmentCurve = Math.sin(i / 42) * 1.25 + Math.sin(i / 120) * 0.45;
+          segmentHill = Math.sin(i / 55) * 2.5;
+        } else if (stageIdx === 1) {
+          // Bellaire Blvd: wider, faster, storefront rhythm.
+          segmentCurve = Math.sin(i / 38) * 1.7;
+          if ((i > 110 && i < 145) || (i > 290 && i < 335)) segmentCurve += 1.5;
+          segmentHill = Math.sin(i / 45) * 2.0;
+        } else if (stageIdx === 2) {
+          // Elsik High School campus zone: slower visual density and small bends.
+          segmentCurve = Math.sin(i / 48) * 1.15;
+          if ((i > 90 && i < 135) || (i > 210 && i < 255)) segmentCurve -= 1.25;
+          segmentHill = Math.sin(i / 60) * 1.5;
+        } else if (stageIdx === 3) {
+          // High Star Dr sprint with green-lit school/parkway feel.
+          segmentCurve = Math.sin(i / 36) * 2.2 + Math.cos(i / 90) * 0.5;
+          segmentHill = Math.sin(i / 50) * 2.2;
+        } else {
+          // Westpark-style night dash: faster, sharper, neon-heavy.
+          segmentCurve = Math.sin(i / 24) * 2.8;
+          segmentHill = Math.sin(i / 42) * 2.4;
         }
 
-        // Color definitions for alternating segment tracks
         const isAlternating = Math.floor(i / 3) % 2 === 0;
         let segmentColors = {
-          road: '#212529',
-          grass: stage.climate === 'desert' ? '#92400e' : stage.climate === 'snow' ? '#ffffff' : '#14532d',
-          rumble: isAlternating ? '#ef4444' : '#f8fafc',
-          lane: isAlternating ? '#6b7280' : '#212529'
+          road: '#20242b',
+          grass: '#10251e',
+          rumble: isAlternating ? '#f8fafc' : '#ef4444',
+          lane: isAlternating ? '#71717a' : '#20242b'
         };
 
-        // Custom climate adjustments
-        if (stage.climate === 'tunnel') {
-          segmentColors.road = '#111827';
-          segmentColors.grass = '#030712'; // dark surroundings
-          segmentColors.rumble = isAlternating ? '#eab308' : '#374151'; // warning stripes
-        } else if (stage.climate === 'city') {
-          segmentColors.road = '#1f2937';
-          segmentColors.grass = '#0f172a'; // urban midnight grid
-          segmentColors.rumble = isAlternating ? '#a855f7' : '#06b6d4'; // bright cyber neon curbs
+        if (stageIdx === 0) {
+          segmentColors = {
+            road: '#1f2937',
+            grass: '#123524',
+            rumble: isAlternating ? '#38bdf8' : '#f8fafc',
+            lane: isAlternating ? '#64748b' : '#1f2937'
+          };
+        } else if (stageIdx === 1) {
+          segmentColors = {
+            road: '#262626',
+            grass: '#1f2937',
+            rumble: isAlternating ? '#f59e0b' : '#f8fafc',
+            lane: isAlternating ? '#fef3c7' : '#262626'
+          };
+        } else if (stageIdx === 2) {
+          segmentColors = {
+            road: '#1e293b',
+            grass: '#0f2f46',
+            rumble: isAlternating ? '#60a5fa' : '#f8fafc',
+            lane: isAlternating ? '#dbeafe' : '#1e293b'
+          };
+        } else if (stageIdx === 3) {
+          segmentColors = {
+            road: '#18212f',
+            grass: '#052e16',
+            rumble: isAlternating ? '#22c55e' : '#f8fafc',
+            lane: isAlternating ? '#86efac' : '#18212f'
+          };
+        } else {
+          segmentColors = {
+            road: '#111827',
+            grass: '#020617',
+            rumble: isAlternating ? '#ec4899' : '#06b6d4',
+            lane: isAlternating ? '#c084fc' : '#111827'
+          };
         }
 
-        // Populate side-road decorations
-        const spritesList = [];
-        if (i % 6 === 0) {
-          // Alternate side left (-1.5) or right (+1.5)
-          const side = (Math.sin(i) > 0) ? 1.5 : -1.5;
-          let spriteName = 'palm';
+        const spritesList: RoadSprite[] = [];
+        const addSprite = (spriteType: string, offset: number, scale = 1.0) => {
+          spritesList.push({ spriteType, offset, scale });
+        };
 
-          if (stage.climate === 'cost') {
-            spriteName = Math.sin(i * 2) > 0.3 ? 'palm' : 'billboard';
-          } else if (stage.climate === 'city') {
-            spriteName = Math.cos(i * 3) > 0 ? 'streetlight' : 'billboard';
-          } else if (stage.climate === 'tunnel') {
-            spriteName = 'tunnel_ring'; // arched overhead light
-          } else if (stage.climate === 'desert') {
-            spriteName = Math.sin(i * 2) > 0 ? 'cactus' : 'billboard';
-          } else if (stage.climate === 'snow') {
-            spriteName = 'snow_pine';
+        // Big fixed landmarks first so they stand out in the route.
+        if (stageIdx === 0 && i === 18) addSprite('alief_gateway', -1.65, 1.45);
+        if (stageIdx === 1 && i === 36) addSprite('bellaire_sign', 1.65, 1.25);
+        if (stageIdx === 2 && (i === 52 || i === 72 || i === 92)) addSprite('elsik_school', i === 72 ? 1.75 : -1.75, 1.65);
+        if (stageIdx === 2 && (i === 120 || i === 210)) addSprite('elsik_rams', i === 120 ? 1.65 : -1.65, 1.35);
+        if (stageIdx === 3 && i === 32) addSprite('high_star_sign', -1.65, 1.25);
+        if (stageIdx === 4 && i === 34) addSprite('westpark_sign', 1.65, 1.25);
+
+        if (i % 6 === 0) {
+          const side = (Math.sin(i * 1.7 + stageIdx) > 0) ? 1.5 : -1.5;
+          let spriteName = 'streetlight';
+
+          if (stageIdx === 0) {
+            spriteName = Math.sin(i * 0.7) > 0.15 ? 'apartment_block' : 'alief_sign';
+          } else if (stageIdx === 1) {
+            spriteName = Math.cos(i * 0.8) > 0 ? 'food_mart' : 'bellaire_sign';
+          } else if (stageIdx === 2) {
+            spriteName = Math.sin(i * 0.4) > 0.25 ? 'school_bus' : 'elsik_rams';
+          } else if (stageIdx === 3) {
+            spriteName = Math.cos(i * 0.7) > 0 ? 'high_star_sign' : 'streetlight';
+          } else {
+            spriteName = Math.sin(i * 0.9) > 0 ? 'westpark_sign' : 'billboard';
           }
 
-          spritesList.push({
-            spriteType: spriteName,
-            offset: side,
-            scale: 1.0
-          });
+          addSprite(spriteName, side, 1.0);
         }
 
         segments.push({
@@ -428,7 +602,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       }
     });
 
-    // Make the last few segments flat to blend back to start loop
+    // Make the last few segments flat to blend back to start loop.
     for (let k = 0; k < 20; k++) {
       segments.push({
         index,
@@ -436,9 +610,9 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         p2: { world: { x: 0, y: 0, z: currentZ + ROAD_SEGMENT_LENGTH }, screen: { x: 0, y: 0, w: 0 } },
         curve: 0,
         hill: 0,
-        color: { road: '#212529', grass: '#14532d', rumble: '#ef4444', lane: '#212529' },
+        color: { road: '#1f2937', grass: '#123524', rumble: '#38bdf8', lane: '#64748b' },
         sprites: [],
-        climate: 'cost'
+        climate: 'city'
       });
       currentZ += ROAD_SEGMENT_LENGTH;
       index++;
@@ -455,26 +629,34 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     const segmentsCount = stateRef.current.totalSegmentsCount;
     if (segmentsCount === 0) return;
 
-    // Spawn 48 AI cars distributed across the track. The spacing keeps the first
-    // seconds playable while still giving enough overtaking opportunities.
-    for (let i = 0; i < 48; i++) {
-      const zPos = 1800 + i * (segmentsCount * ROAD_SEGMENT_LENGTH / 50);
+    // The Alief build uses a late-80s / early-90s traffic roster: Acura
+    // Integra, Ford Tempo, 1986 Toyota MR2, Pontiac Fiero, and Ford Probe.
+    // Ambulances/trucks stay rare so traffic still has readable variety.
+    for (let i = 0; i < 56; i++) {
+      const zPos = 1700 + i * (segmentsCount * ROAD_SEGMENT_LENGTH / 58);
       const laneId = Math.floor(Math.random() * 3) - 1; // -1, 0, 1 -> maps to offset -0.6, 0.0, 0.6
-      const speedKmh = 95 + Math.random() * 135; // 95 to 230 km/h
+      const baseModel = ALIEF_TRAFFIC_MODELS[i % ALIEF_TRAFFIC_MODELS.length];
+      const selectedType: AliefTrafficCar =
+        i % 17 === 0 ? 'truck' :
+        i % 13 === 0 ? 'ambulance' :
+        baseModel;
 
-      const types: Array<'blue' | 'yellow' | 'green' | 'ambulance' | 'truck'> = ['blue', 'yellow', 'green', 'truck'];
-      // Flashing ambulance speed runner
-      const selectedType = (i % 8 === 0) ? 'ambulance' : types[Math.floor(Math.random() * types.length)];
+      let speedKmh = 90 + Math.random() * 115;
+      if (selectedType === 'acura_integra' || selectedType === 'ford_probe') speedKmh += 20;
+      if (selectedType === 'mr2_86' || selectedType === 'pontiac_fiero') speedKmh += 28;
+      if (selectedType === 'ford_tempo') speedKmh -= 10;
+      if (selectedType === 'truck') speedKmh -= 25;
+      if (selectedType === 'ambulance') speedKmh += 38;
 
       carsList.push({
         offset: laneId * 0.61,
         z: zPos,
-        speed: speedKmh,
+        speed: clamp(speedKmh, 75, 255),
         spriteType: selectedType,
-        width: selectedType === 'truck' ? 1.4 : 1.0,
-        length: selectedType === 'truck' ? 150 : 100,
-        color: selectedType === 'ambulance' ? '#ef4444' : selectedType === 'blue' ? '#3b82f6' : '#eab308',
-        laneChangeTimer: 2.5 + Math.random() * 4.5,
+        width: selectedType === 'truck' ? 1.35 : selectedType === 'ford_tempo' ? 1.08 : 1.0,
+        length: selectedType === 'truck' ? 150 : selectedType === 'ford_tempo' ? 118 : 104,
+        color: TRAFFIC_CAR_COLORS[selectedType],
+        laneChangeTimer: 2.4 + Math.random() * 5.0,
         laneTarget: laneId * 0.61,
         isPassing: false
       });
@@ -621,13 +803,137 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       ctx.font = `bold ${Math.round(height * 0.22)}px monospace`;
       ctx.textAlign = 'center';
       
-      const phrases = ['SPEED HQ', 'TURBO', 'SHIFT UP', 'PLAY NOW'];
+      const phrases = ['ALIEF TX', 'ELSIK RAMS', 'SHIFT UP', 'WESTPARK'];
       const phrase = phrases[Math.floor(animationFrame / 80) % phrases.length];
       
       ctx.fillStyle = '#06b6d4'; // cyan glow
       ctx.shadowBlur = 12;
       ctx.shadowColor = '#06b6d4';
       ctx.fillText(phrase, 0, -height * 0.65);
+    } else if (type === 'alief_gateway') {
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(-width * 0.7, -height * 0.75, width * 1.4, height * 0.45);
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 4;
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = '#38bdf8';
+      ctx.strokeRect(-width * 0.7, -height * 0.75, width * 1.4, height * 0.45);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = `bold ${Math.round(height * 0.18)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText('ALIEF, TX', 0, -height * 0.55);
+      ctx.fillStyle = '#475569';
+      ctx.fillRect(-width * 0.48, -height * 0.3, width * 0.08, height * 0.3);
+      ctx.fillRect(width * 0.4, -height * 0.3, width * 0.08, height * 0.3);
+    } else if (type === 'alief_sign' || type === 'bellaire_sign' || type === 'high_star_sign' || type === 'westpark_sign') {
+      const signText =
+        type === 'alief_sign' ? 'ALIEF' :
+        type === 'bellaire_sign' ? 'BELLAIRE BLVD' :
+        type === 'high_star_sign' ? 'HIGH STAR DR' :
+        'WESTPARK';
+
+      ctx.fillStyle = '#475569';
+      ctx.fillRect(-width * 0.04, -height * 0.85, width * 0.08, height * 0.85);
+      ctx.fillStyle = type === 'bellaire_sign' ? '#92400e' : type === 'westpark_sign' ? '#581c87' : '#065f46';
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = type === 'westpark_sign' ? '#ec4899' : '#22c55e';
+      ctx.beginPath();
+      ctx.roundRect(-width * 0.55, -height * 1.05, width * 1.1, height * 0.32, 4);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${Math.round(height * 0.12)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText(signText, 0, -height * 0.84);
+    } else if (type === 'food_mart') {
+      ctx.fillStyle = '#111827';
+      ctx.fillRect(-width * 0.65, -height * 0.75, width * 1.3, height * 0.75);
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillRect(-width * 0.65, -height * 0.75, width * 1.3, height * 0.16);
+      ctx.fillStyle = '#ef4444';
+      ctx.fillRect(-width * 0.55, -height * 0.52, width * 0.35, height * 0.52);
+      ctx.fillStyle = '#06b6d4';
+      ctx.fillRect(-width * 0.12, -height * 0.48, width * 0.55, height * 0.22);
+      ctx.font = `bold ${Math.round(height * 0.13)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#111827';
+      ctx.fillText('FOOD MART', 0, -height * 0.62);
+    } else if (type === 'apartment_block') {
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(-width * 0.45, -height * 1.0, width * 0.9, height * 1.0);
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(-width * 0.35, -height * 0.88, width * 0.7, height * 0.12);
+      ctx.fillStyle = '#fef3c7';
+      for (let row = 0; row < 4; row++) {
+        for (let col = 0; col < 3; col++) {
+          if ((row + col + Math.floor(animationFrame / 80)) % 3 !== 0) {
+            ctx.fillRect(-width * 0.28 + col * width * 0.25, -height * 0.66 + row * height * 0.14, width * 0.08, height * 0.07);
+          }
+        }
+      }
+    } else if (type === 'elsik_school') {
+      // Large stylized campus building with a readable Elsik High School sign.
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(-width * 0.9, -height * 0.85, width * 1.8, height * 0.85);
+      ctx.fillStyle = '#1d4ed8';
+      ctx.fillRect(-width * 0.9, -height * 0.85, width * 1.8, height * 0.16);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.fillRect(-width * 0.72, -height * 0.58, width * 0.26, height * 0.18);
+      ctx.fillRect(-width * 0.28, -height * 0.58, width * 0.26, height * 0.18);
+      ctx.fillRect(width * 0.16, -height * 0.58, width * 0.26, height * 0.18);
+      ctx.fillStyle = '#0b1220';
+      ctx.fillRect(-width * 0.12, -height * 0.28, width * 0.24, height * 0.28);
+      ctx.strokeStyle = '#60a5fa';
+      ctx.lineWidth = 3;
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = '#60a5fa';
+      ctx.strokeRect(-width * 0.9, -height * 0.85, width * 1.8, height * 0.85);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${Math.round(height * 0.13)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText('ELSIK HIGH SCHOOL', 0, -height * 0.72);
+    } else if (type === 'elsik_rams') {
+      ctx.fillStyle = '#1d4ed8';
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = '#60a5fa';
+      ctx.beginPath();
+      ctx.roundRect(-width * 0.55, -height * 0.95, width * 1.1, height * 0.48, 5);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-width * 0.48, -height * 0.88, width * 0.96, height * 0.34);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${Math.round(height * 0.13)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText('ELSIK', 0, -height * 0.74);
+      ctx.fillText('RAMS', 0, -height * 0.59);
+      // Simple ram-horn icon.
+      ctx.strokeStyle = '#bfdbfe';
+      ctx.beginPath();
+      ctx.arc(-width * 0.22, -height * 0.38, width * 0.13, Math.PI * 0.2, Math.PI * 1.45);
+      ctx.arc(width * 0.22, -height * 0.38, width * 0.13, Math.PI * 1.55, Math.PI * 0.8, true);
+      ctx.stroke();
+    } else if (type === 'school_bus') {
+      ctx.fillStyle = '#facc15';
+      ctx.beginPath();
+      ctx.roundRect(-width * 0.68, -height * 0.58, width * 1.36, height * 0.42, 5);
+      ctx.fill();
+      ctx.fillStyle = '#111827';
+      for (let col = 0; col < 4; col++) {
+        ctx.fillRect(-width * 0.48 + col * width * 0.25, -height * 0.5, width * 0.16, height * 0.12);
+      }
+      ctx.fillStyle = '#000000';
+      ctx.beginPath();
+      ctx.arc(-width * 0.42, -height * 0.13, width * 0.11, 0, Math.PI * 2);
+      ctx.arc(width * 0.42, -height * 0.13, width * 0.11, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = `bold ${Math.round(height * 0.09)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#111827';
+      ctx.fillText('ALIEF ISD', 0, -height * 0.26);
     } else if (type === 'tunnel_ring') {
       // Arched neon strip spanning overhead. Due to drawing order we can draw a grand archway
       ctx.strokeStyle = '#eab308';
@@ -655,70 +961,152 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     ctx.save();
     ctx.translate(cx, cy);
 
-    const isAmbulance = car.spriteType === 'ambulance';
-    const isTruck = car.spriteType === 'truck';
+    const carType = car.spriteType as AliefTrafficCar | string;
 
-    if (isAmbulance) {
+    const drawWheels = (front = 0.42, rear = -0.42) => {
+      ctx.fillStyle = '#020617';
+      ctx.fillRect(rear * size - size * 0.09, -size * 0.1, size * 0.18, size * 0.14);
+      ctx.fillRect(front * size - size * 0.09, -size * 0.1, size * 0.18, size * 0.14);
+    };
+
+    const drawLabel = (label: string, y: number) => {
+      ctx.save();
+      ctx.font = `bold ${Math.max(7, Math.round(size * 0.12))}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillText(label, 0, y);
+      ctx.restore();
+    };
+
+    if (carType === 'ambulance') {
       // Red/White emergency speed-runner
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(-size * 0.5, -size * 0.61, size, size * 0.61);
-      
-      // Windshield
       ctx.fillStyle = '#1e293b';
       ctx.fillRect(-size * 0.4, -size * 0.55, size * 0.8, size * 0.16);
 
-      // Flashing top siren
       const flash = Math.sin(Date.now() / 80) > 0;
       ctx.fillStyle = flash ? '#ef4444' : '#3b82f6';
       ctx.shadowBlur = flash ? 15 : 0;
       ctx.shadowColor = '#ef4444';
       ctx.fillRect(-size * 0.15, -size * 0.72, size * 0.3, size * 0.12);
 
-      // Rear break lamps
       ctx.shadowBlur = 0;
       ctx.fillStyle = '#ef4444';
       ctx.fillRect(-size * 0.45, -size * 0.22, size * 0.15, size * 0.1);
       ctx.fillRect(size * 0.3, -size * 0.22, size * 0.15, size * 0.1);
-    } else if (isTruck) {
+      drawWheels();
+    } else if (carType === 'truck') {
       // Heavy shipping vehicle (huge grey block)
       ctx.fillStyle = '#334155';
       ctx.fillRect(-size * 0.65, -size * 0.95, size * 1.3, size * 0.95);
-
-      // Left & right warning hazard stripes
       ctx.fillStyle = '#f59e0b';
       ctx.fillRect(-size * 0.61, -size * 0.18, size * 0.3, size * 0.08);
       ctx.fillRect(size * 0.31, -size * 0.18, size * 0.3, size * 0.08);
-
-      // Rear massive tires
       ctx.fillStyle = '#000000';
       ctx.fillRect(-size * 0.65, -size * 0.12, size * 0.22, size * 0.15);
       ctx.fillRect(size * 0.43, -size * 0.12, size * 0.22, size * 0.15);
-    } else {
-      // Standard sporty race car (blue or yellow)
+    } else if (carType === 'acura_integra') {
+      // Long, low Acura Integra hatchback.
       ctx.fillStyle = car.color;
-      // Body chassis
+      ctx.beginPath();
+      ctx.moveTo(-size * 0.62, -size * 0.21);
+      ctx.lineTo(-size * 0.42, -size * 0.48);
+      ctx.lineTo(size * 0.28, -size * 0.5);
+      ctx.lineTo(size * 0.62, -size * 0.22);
+      ctx.lineTo(size * 0.54, -size * 0.04);
+      ctx.lineTo(-size * 0.56, -size * 0.04);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(-size * 0.24, -size * 0.45, size * 0.42, size * 0.16);
+      ctx.fillStyle = '#fef08a';
+      ctx.fillRect(-size * 0.58, -size * 0.2, size * 0.12, size * 0.05);
+      ctx.fillStyle = '#7f1d1d';
+      ctx.fillRect(size * 0.43, -size * 0.2, size * 0.13, size * 0.06);
+      drawLabel('INTEGRA', -size * 0.11);
+      drawWheels(0.42, -0.42);
+    } else if (carType === 'ford_tempo') {
+      // Boxy Ford Tempo sedan.
+      ctx.fillStyle = car.color;
+      ctx.fillRect(-size * 0.55, -size * 0.38, size * 1.1, size * 0.34);
+      ctx.fillRect(-size * 0.32, -size * 0.58, size * 0.64, size * 0.24);
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(-size * 0.25, -size * 0.54, size * 0.22, size * 0.14);
+      ctx.fillRect(size * 0.05, -size * 0.54, size * 0.22, size * 0.14);
+      ctx.fillStyle = '#fef3c7';
+      ctx.fillRect(-size * 0.55, -size * 0.22, size * 0.1, size * 0.05);
+      ctx.fillStyle = '#ef4444';
+      ctx.fillRect(size * 0.45, -size * 0.22, size * 0.1, size * 0.05);
+      drawLabel('TEMPO', -size * 0.11);
+      drawWheels(0.37, -0.37);
+    } else if (carType === 'mr2_86') {
+      // 1986 MR2: small mid-engine wedge with pop-up headlight vibe.
+      ctx.fillStyle = car.color;
+      ctx.beginPath();
+      ctx.moveTo(-size * 0.58, -size * 0.16);
+      ctx.lineTo(-size * 0.32, -size * 0.45);
+      ctx.lineTo(size * 0.25, -size * 0.5);
+      ctx.lineTo(size * 0.58, -size * 0.2);
+      ctx.lineTo(size * 0.5, -size * 0.04);
+      ctx.lineTo(-size * 0.52, -size * 0.04);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(-size * 0.05, -size * 0.46, size * 0.28, size * 0.16);
+      ctx.fillStyle = '#facc15';
+      ctx.fillRect(-size * 0.45, -size * 0.28, size * 0.13, size * 0.06);
+      ctx.fillRect(-size * 0.23, -size * 0.31, size * 0.13, size * 0.06);
+      ctx.fillStyle = '#ef4444';
+      ctx.fillRect(size * 0.42, -size * 0.2, size * 0.12, size * 0.06);
+      drawLabel('86 MR2', -size * 0.1);
+      drawWheels(0.36, -0.38);
+    } else if (carType === 'pontiac_fiero') {
+      // Pontiac Fiero: angular red/orange wedge.
+      ctx.fillStyle = car.color;
+      ctx.beginPath();
+      ctx.moveTo(-size * 0.62, -size * 0.12);
+      ctx.lineTo(-size * 0.35, -size * 0.44);
+      ctx.lineTo(size * 0.22, -size * 0.48);
+      ctx.lineTo(size * 0.62, -size * 0.18);
+      ctx.lineTo(size * 0.52, -size * 0.04);
+      ctx.lineTo(-size * 0.56, -size * 0.04);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#111827';
+      ctx.fillRect(-size * 0.04, -size * 0.43, size * 0.3, size * 0.14);
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(-size * 0.55, -size * 0.2, size * 0.12, size * 0.05);
+      ctx.fillStyle = '#7f1d1d';
+      ctx.fillRect(size * 0.43, -size * 0.2, size * 0.13, size * 0.05);
+      drawLabel('FIERO', -size * 0.1);
+      drawWheels(0.38, -0.4);
+    } else if (carType === 'ford_probe') {
+      // Ford Probe: smooth aero hatch.
+      ctx.fillStyle = car.color;
+      ctx.beginPath();
+      ctx.ellipse(0, -size * 0.22, size * 0.62, size * 0.26, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#0f172a';
+      ctx.beginPath();
+      ctx.ellipse(-size * 0.04, -size * 0.36, size * 0.28, size * 0.12, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#bfdbfe';
+      ctx.fillRect(-size * 0.55, -size * 0.23, size * 0.12, size * 0.05);
+      ctx.fillStyle = '#ef4444';
+      ctx.fillRect(size * 0.43, -size * 0.23, size * 0.12, size * 0.05);
+      drawLabel('PROBE', -size * 0.1);
+      drawWheels(0.39, -0.39);
+    } else {
+      // Fallback if older saved traffic data is still in memory.
+      ctx.fillStyle = car.color || '#3b82f6';
       ctx.fillRect(-size * 0.5, -size * 0.35, size, size * 0.31);
-      // Cockpit hood cabin
       ctx.fillStyle = '#0f172a';
       ctx.fillRect(-size * 0.35, -size * 0.52, size * 0.7, size * 0.18);
-
-      // Spoilers wing
-      ctx.fillStyle = car.color;
-      ctx.fillRect(-size * 0.55, -size * 0.56, size * 1.1, size * 0.08);
-      // Spoiler supports
-      ctx.fillStyle = '#000000';
-      ctx.fillRect(-size * 0.45, -size * 0.48, size * 0.06, size * 0.1);
-      ctx.fillRect(size * 0.39, -size * 0.48, size * 0.06, size * 0.1);
-
-      // Tail lights
       ctx.fillStyle = '#ef4444';
       ctx.fillRect(-size * 0.45, -size * 0.26, size * 0.15, size * 0.06);
       ctx.fillRect(size * 0.3, -size * 0.26, size * 0.15, size * 0.06);
-
-      // Wheels
-      ctx.fillStyle = '#000';
-      ctx.fillRect(-size * 0.52, -size * 0.12, size * 0.18, size * 0.12);
-      ctx.fillRect(size * 0.34, -size * 0.12, size * 0.18, size * 0.12);
+      drawWheels();
     }
 
     ctx.restore();
@@ -733,7 +1121,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
 
     // Position of player near the bottom of segment viewport
     const px = canvas.width / 2;
-    const py = canvas.height * 0.78;
+    const py = canvas.height * PLAYER_SPRITE_Y_FRACTION;
     const pSize = 75; // dynamic relative display size
 
     ctx.translate(px, py);
@@ -856,6 +1244,14 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       const delta = Math.min((highResTime - lastTime) / 1000.0, 0.1); // cap latency jump
       lastTime = highResTime;
 
+      // Debug pause: freeze the world (last frame stays on screen) but keep the
+      // RAF loop alive so the Resume button can pick it straight back up. lastTime
+      // is refreshed above, so resuming does not produce a giant delta jump.
+      if (stateRef.current.paused) {
+        requestAnimationFrame(gameTick);
+        return;
+      }
+
       // Handle start sequence countdown
       if (stateRef.current.isCountingDown) {
         stateRef.current.countdownVal -= delta;
@@ -903,7 +1299,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     if (s.isCountingDown) return; // Freeze players until countdown clears
 
     const previousPlayerZ = s.playerZ;
-    const maxSpeed = s.gear === 'LOW' ? LOW_GEAR_TOP_SPEED : HIGH_GEAR_TOP_SPEED;
+    const maxSpeed = topSpeedForGear(s.gear);
 
     // Handle Time Tock
     s.timeLimit -= dt;
@@ -914,30 +1310,17 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       return;
     }
 
-    // A lightweight arcade drivetrain: torque fades near redline, high gear lugs
-    // under ~125 km/h, and drag is always applied so lift-off feels natural.
+    // Integrate the arcade drivetrain (see ../lib/physics for the model).
     if (s.isCrashActive) {
       s.speed -= 260 * dt;
       s.targetSteerInput = 0;
     } else {
-      const speedRatio = clamp(s.speed / maxSpeed, 0, 1);
-      let acceleration = 0;
-
-      if (s.accelInput && !s.brakeInput) {
-        const basePower = s.gear === 'LOW' ? 255 : 190;
-        const torqueCurve = clamp(1.0 - 0.62 * speedRatio * speedRatio, 0.22, 1.0);
-        const lugPenalty = s.gear === 'HIGH' && s.speed < 125 ? 0.34 : 1.0;
-        acceleration += basePower * torqueCurve * lugPenalty;
-      }
-
-      if (s.brakeInput) {
-        acceleration -= 470 + s.speed * 0.18;
-      } else if (!s.accelInput) {
-        acceleration -= 24 + s.speed * 0.055;
-      }
-
-      const aeroDrag = 10 + s.speed * s.speed * 0.00034;
-      s.speed += (acceleration - aeroDrag) * dt;
+      s.speed += computeDrivetrainAcceleration({
+        gear: s.gear,
+        speed: s.speed,
+        accelInput: s.accelInput,
+        brakeInput: s.brakeInput,
+      }) * dt;
     }
 
     // Map current active segment to find track curves and hills
@@ -972,7 +1355,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     audio.setEngineSound(s.speed, s.gear, s.rpm);
 
     // Player position Z physics
-    const speedMs = (s.speed / 3.6) * SPEED_TO_WORLD_MULTIPLIER;
+    const speedMs = speedToWorldUnitsPerSec(s.speed);
     s.playerZ += speedMs * dt;
     s.totalDistanceDriven += speedMs * dt * 0.01;
 
@@ -996,10 +1379,12 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       const shoulderGrip = onShoulder ? clamp(1.0 - offRoadDepth * 0.35, 0.48, 1.0) : 1.0;
       const grip = baseGrip * shoulderGrip;
 
-      const steeringAuthority = (1.15 + speed01 * 2.15) * grip;
-      const curvePull = currentSegment.curve * (0.18 + speed01 * 0.72);
-      const counterSteerAssist = clamp(-curvePull * 0.18, -0.35, 0.35);
-      const lateralAcceleration = (s.steerInput * steeringAuthority + counterSteerAssist - curvePull) * grip;
+      const lateralAcceleration = computeLateralAcceleration({
+        steerInput: s.steerInput,
+        speed: s.speed,
+        segmentCurve: currentSegment.curve,
+        grip,
+      });
 
       s.lateralVelocity += lateralAcceleration * dt;
 
@@ -1060,7 +1445,16 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         time: Math.ceil(s.timeLimit),
         stageName: SCENERY_STAGES[s.currentStageIdx].name,
         stageIdx: s.currentStageIdx,
-        stageProgressPct: Math.round(s.stageProgress * 100)
+        stageProgressPct: Math.round(s.stageProgress * 100),
+        debug: {
+          nearestRelZ: s.debug.nearestRelZ,
+          nearestCamZ: s.debug.nearestCamZ,
+          nearestLateral: Math.round(s.debug.nearestLateral * 100) / 100,
+          nearestHalfWidth: Math.round(s.debug.nearestHalfWidth * 100) / 100,
+          nearestType: s.debug.nearestType,
+          nearestInLane: s.debug.nearestInLane,
+          lastHitRelZ: s.debug.lastHitRelZ
+        }
       }));
     }
   };
@@ -1080,11 +1474,18 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
 
   const updateAiCars = (dt: number, _activeSegmentIdx: number, totalLength: number, previousPlayerZ: number) => {
     const s = stateRef.current;
-    const playerZ = s.playerZ;
+    // Collisions and passes are resolved against the PLAYER CAR's on-screen
+    // position (PLAYER_CAR_ROAD_Z ahead of the camera — where the sprite is
+    // actually drawn), NOT the camera, so a crash lines up with a visible car.
+    const playerCarZ = s.playerZ + PLAYER_CAR_ROAD_Z;
+    const prevPlayerCarZ = previousPlayerZ + PLAYER_CAR_ROAD_Z;
+
+    let nearest: { relZ: number; lateral: number; halfWidth: number; type: string } | null = null;
+    let collidedThisFrame = false;
 
     s.activeCars.forEach(car => {
       const carPrevZ = car.z;
-      const speedMs = (car.speed / 3.6) * SPEED_TO_WORLD_MULTIPLIER;
+      const speedMs = speedToWorldUnitsPerSec(car.speed);
       car.z += speedMs * dt;
 
       // Handle wrapping at end of track
@@ -1092,16 +1493,19 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         car.z -= totalLength;
       }
 
+      // Position relative to the player car: + = ahead, - = behind/passed.
+      const relZ = normalizeRelativeZ(car.z - playerCarZ, totalLength);
+      const prevRelZ = normalizeRelativeZ(carPrevZ - prevPlayerCarZ, totalLength);
+
       // Lane changes are measured in seconds, not world units. Keep them
       // occasional and avoid surprise swerves right on top of the player.
-      let relZ = normalizeRelativeZ(car.z - playerZ, totalLength);
       car.laneChangeTimer -= dt;
       if (car.laneChangeTimer <= 0) {
         car.laneChangeTimer = 2.2 + Math.random() * 5.5;
-        const playerNearby = relZ > -160 && relZ < 260;
+        const playerNearby = relZ > -160 && relZ < 320;
         if (!playerNearby) {
           const newLane = Math.floor(Math.random() * 3) - 1; // -1, 0, 1
-          car.laneTarget = newLane * 0.61;
+          car.laneTarget = newLane * LANE_SPACING;
         }
       }
 
@@ -1116,18 +1520,20 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         }
       }
 
-      relZ = normalizeRelativeZ(car.z - playerZ, totalLength);
-      const prevRelZ = normalizeRelativeZ(carPrevZ - previousPlayerZ, totalLength);
-
-      // Swept collision: at 300+ km/h a single frame can skip a small overlap
-      // window, so detect sign-crossing as well as immediate overlap.
-      const sweptAcrossPlayer = (prevRelZ > 0 && relZ <= 0) || (prevRelZ < 0 && relZ >= 0 && car.speed > s.speed);
-      const zOverlap = Math.min(Math.abs(relZ), Math.abs(prevRelZ)) < 45 || sweptAcrossPlayer;
-      const xCollisionLimit = 0.25 + car.width * 0.15;
+      const xCollisionLimit = carCollisionHalfWidth(car.width);
       const lateralDistance = Math.abs(car.offset - s.playerX);
-      const xOverlap = lateralDistance < xCollisionLimit;
 
-      if (zOverlap && xOverlap && !s.isCrashActive && s.invincibilityTimer <= 0) {
+      const collided = detectCarCollision({
+        playerX: s.playerX,
+        carOffset: car.offset,
+        carWidth: car.width,
+        relZ,
+        prevRelZ,
+      });
+
+      if (collided && !s.isCrashActive && s.invincibilityTimer <= 0) {
+        collidedThisFrame = true;
+        s.debug.lastHitRelZ = Math.round(relZ); // the car that actually hit, not the nearest
         s.isCrashActive = true;
         s.crashAnimationTimer = 1.05;
         s.speed = Math.max(18, s.speed * 0.18);
@@ -1160,7 +1566,43 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       if (Math.abs(relZ) > 380) {
         car.isPassing = false;
       }
+
+      // Track the closest car (to the player car) for the on-screen debug panel.
+      if (!nearest || Math.abs(relZ) < Math.abs(nearest.relZ)) {
+        nearest = { relZ, lateral: lateralDistance, halfWidth: xCollisionLimit, type: car.spriteType };
+      }
     });
+
+    // Publish a debug snapshot for the overlay (read on the throttled UI tick).
+    if (nearest) {
+      const n = nearest as { relZ: number; lateral: number; halfWidth: number; type: string };
+      s.debug.nearestRelZ = Math.round(n.relZ);
+      s.debug.nearestCamZ = Math.round(n.relZ + PLAYER_CAR_ROAD_Z);
+      s.debug.nearestLateral = n.lateral;
+      s.debug.nearestHalfWidth = n.halfWidth;
+      s.debug.nearestType = n.type;
+      s.debug.nearestInLane = n.lateral < n.halfWidth;
+    }
+
+    // With debug on, freeze on impact so the readout can be inspected. Push the
+    // exact collision-frame snapshot to the UI (the throttled tick won't run
+    // while paused).
+    if (collidedThisFrame && s.showDebug) {
+      s.paused = true;
+      setUiState(prev => ({
+        ...prev,
+        paused: true,
+        debug: {
+          nearestRelZ: s.debug.nearestRelZ,
+          nearestCamZ: s.debug.nearestCamZ,
+          nearestLateral: Math.round(s.debug.nearestLateral * 100) / 100,
+          nearestHalfWidth: Math.round(s.debug.nearestHalfWidth * 100) / 100,
+          nearestType: s.debug.nearestType,
+          nearestInLane: s.debug.nearestInLane,
+          lastHitRelZ: s.debug.lastHitRelZ
+        }
+      }));
+    }
 
     // Handle background particles flow (speed dust particles flying backwards).
     // Scale by dt so high-refresh displays do not spawn twice as much dust.
@@ -1261,8 +1703,14 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
       // Accumulate road curve modifiers
       accumulatedCurveAddX += segmentCurveAt(idx);
 
-      project(p1, s.playerX * ROAD_WIDTH, cameraY, cameraZ, canvas.width, canvas.height, accumulatedCurveAddX - (percentZ * seg.curve));
-      project(p2, s.playerX * ROAD_WIDTH, cameraY, cameraZ, canvas.width, canvas.height, accumulatedCurveAddX + segmentCurveAt(idx) - (percentZ * seg.curve));
+      // playerX is in road-half-width units (±1 == road edge). The tarmac is
+      // drawn ±screen.w/2 wide, which corresponds to a world X of ROAD_WIDTH/2,
+      // so the camera must shift by playerX * ROAD_WIDTH/2 for the edge to line
+      // up at playerX == 1. (Using the full ROAD_WIDTH doubled the offset and
+      // pushed the side lanes off the road.)
+      const cameraX = s.playerX * (ROAD_WIDTH / 2);
+      project(p1, cameraX, cameraY, cameraZ, canvas.width, canvas.height, accumulatedCurveAddX - (percentZ * seg.curve));
+      project(p2, cameraX, cameraY, cameraZ, canvas.width, canvas.height, accumulatedCurveAddX + segmentCurveAt(idx) - (percentZ * seg.curve));
 
       renderPointsList.push({
         segment: seg,
@@ -1292,6 +1740,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     for (let i = VIEW_DEPTH - 1; i > 0; i--) {
       const render = renderPointsList[i];
       const p1 = render.p1;
+      const p2 = render.p2;
       const seg = render.segment;
 
       // Render roadside trees, poles, tunnels, billboards
@@ -1301,42 +1750,42 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         const xPos = p1.screen.x + Math.round(sprOffset * p1.screen.w * 0.52);
         const yPos = p1.screen.y;
         
-        // Size scales based on screen projection factor
-        const sprWidth = Math.round(p1.screen.w * 0.18);
-        const sprHeight = Math.round(p1.screen.w * 0.22);
+        // Size scales based on screen projection factor and per-landmark scale.
+        const spriteScale = sprite.scale ?? 1.0;
+        const sprWidth = Math.round(p1.screen.w * 0.18 * spriteScale);
+        const sprHeight = Math.round(p1.screen.w * 0.22 * spriteScale);
 
         drawVectorSprite(ctx, sprite.spriteType, sprWidth, sprHeight, xPos, yPos, stepNum);
       });
 
-      // Render AI cars that fit on this segment section
+      // Render AI cars sitting on this segment. We reuse the segment's own
+      // projected road slice (p1) so each car tracks the road's curve, hills,
+      // and width exactly. The previous code re-projected every car with an
+      // independent curve sum and a doubled offset, which drifted side-lane
+      // cars off into the grass and made collisions look wrong.
       s.activeCars.forEach(car => {
-        // Match segment
         const carSegmentIdx = Math.floor(car.z / ROAD_SEGMENT_LENGTH) % s.roadSegments.length;
-        if (carSegmentIdx === seg.index) {
-          // Calculate project position
-          const relZ = normalizeRelativeZ(car.z - startZ, totalLength);
-          if (relZ <= DISTANCE_TO_PLAYER || relZ >= VIEW_DEPTH * ROAD_SEGMENT_LENGTH) return;
+        if (carSegmentIdx !== seg.index) return;
 
-          const scale = CAMERA_DEPTH / relZ;
-          
-          let carAccumCurve = 0;
-          for (let k = 0; k <= VIEW_DEPTH; k++) {
-            const lookIdx = (startSegmentIdx + k) % s.roadSegments.length;
-            if (lookIdx === carSegmentIdx) {
-              break;
-            }
-            carAccumCurve += segmentCurveAt(lookIdx);
-          }
+        // Skip cars that are essentially on top of / behind the camera.
+        const relZ = normalizeRelativeZ(car.z - startZ, totalLength);
+        if (relZ <= DISTANCE_TO_PLAYER) return;
 
-          const carWorldX = car.offset * ROAD_WIDTH;
-          const carScreenW = Math.round(scale * ROAD_WIDTH * (canvas.width / 2));
-          const carScreenX = Math.round((canvas.width / 2) + ((carWorldX - s.playerX * ROAD_WIDTH + carAccumCurve) * scale * (canvas.width / 2)));
-          const carScreenY = Math.round((canvas.height / 2) - ((seg.hill * 10.0 - cameraY) * scale * (canvas.height / 2)));
-          
-          const size = Math.round(carScreenW * 0.14);
+        // Interpolate the car's position across its segment (near edge p1 -> far
+        // edge p2) by how far along the segment it actually sits. Snapping the
+        // car to p1 made it jump a whole segment at a time, which reads as a
+        // flicker/judder at high speed. car.offset is in road-half-width units
+        // (±1 == road edge).
+        const frac = (car.z % ROAD_SEGMENT_LENGTH) / ROAD_SEGMENT_LENGTH;
+        const centerX = p1.screen.x + (p2.screen.x - p1.screen.x) * frac;
+        const centerY = p1.screen.y + (p2.screen.y - p1.screen.y) * frac;
+        const roadWidth = p1.screen.w + (p2.screen.w - p1.screen.w) * frac;
 
-          drawAiCar(ctx, car, carScreenX, carScreenY, size);
-        }
+        const carScreenX = Math.round(centerX + car.offset * (roadWidth / 2));
+        const carScreenY = Math.round(centerY);
+        const size = Math.max(1, Math.round(roadWidth * 0.14));
+
+        drawAiCar(ctx, car, carScreenX, carScreenY, size);
       });
     }
 
@@ -1373,96 +1822,134 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     return 0;
   };
 
-  // Draw background horizons matching stages (sunsets/wireframes/tunnels)
+  // Draw background horizons matching Alief route stages.
   const drawBackgroundScenery = (ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, steerOffset: number) => {
     const stageIdx = stateRef.current.currentStageIdx;
-    
     ctx.save();
 
     const skyGrad = ctx.createLinearGradient(0, 0, 0, canvas.height * 0.5);
+    const drawStreetLights = (color: string, count = 7) => {
+      for (let j = 0; j < count; j++) {
+        const x = (j * (canvas.width / (count - 1))) - steerOffset * (1.5 + j * 0.08);
+        ctx.strokeStyle = '#475569';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, canvas.height * 0.5);
+        ctx.lineTo(x, canvas.height * 0.22 + (j % 2) * 12);
+        ctx.lineTo(x + 24, canvas.height * 0.22 + (j % 2) * 12);
+        ctx.stroke();
+        ctx.fillStyle = color;
+        ctx.shadowBlur = 18;
+        ctx.shadowColor = color;
+        ctx.beginPath();
+        ctx.arc(x + 24, canvas.height * 0.23 + (j % 2) * 12, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    };
 
     if (stageIdx === 0) {
-      // 1. Palms and blue shore
-      skyGrad.addColorStop(0, '#021526');
-      skyGrad.addColorStop(0.7, '#0ea5e9');
-      skyGrad.addColorStop(1, '#38bdf8');
+      // 1. Alief neighborhood night cruise.
+      skyGrad.addColorStop(0, '#07111f');
+      skyGrad.addColorStop(0.7, '#123524');
+      skyGrad.addColorStop(1, '#0f766e');
       ctx.fillStyle = skyGrad;
       ctx.fillRect(0, 0, canvas.width, canvas.height * 0.5);
+      drawStreetLights('#38bdf8', 6);
 
-      // Simple yellow sun dropping
-      ctx.fillStyle = '#f59e0b';
-      ctx.shadowBlur = 40;
-      ctx.shadowColor = '#f59e0b';
-      ctx.beginPath();
-      ctx.arc(canvas.width * 0.5 + steerOffset * 3, canvas.height * 0.34, 45, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (stageIdx === 1) {
-      // 2. Neon Metropolis Skyline
-      skyGrad.addColorStop(0, '#090514');
-      skyGrad.addColorStop(1, '#4a044e');
-      ctx.fillStyle = skyGrad;
-      ctx.fillRect(0, 0, canvas.width, canvas.height * 0.5);
-
-      // Draw cybercity skyscrapers blocks
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.4)'; // distant skyline shadow
-      for (let j = 0; j < 8; j++) {
-        const offset = (j * (canvas.width / 6)) - steerOffset * 2.5;
-        ctx.fillRect(offset, canvas.height * 0.25 + (j % 3) * 20, 80, canvas.height * 0.25);
-      }
-      ctx.fillStyle = '#0f172a'; // close skyline blocks
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = '#ec4899'; // violet wireframe
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
       for (let j = 0; j < 6; j++) {
-        const offset = (j * (canvas.width / 5)) - steerOffset * 4.0;
-        ctx.fillRect(offset, canvas.height * 0.3 + (j % 2) * 15, 110, canvas.height * 0.2);
-        ctx.strokeRect(offset, canvas.height * 0.3 + (j % 2) * 15, 110, canvas.height * 0.2);
+        const x = (j * canvas.width / 5) - steerOffset * 2.0;
+        ctx.fillRect(x, canvas.height * 0.34 + (j % 2) * 14, 95, canvas.height * 0.16);
+      }
+
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('WELCOME TO ALIEF', canvas.width * 0.5 - steerOffset * 1.8, canvas.height * 0.28);
+    } else if (stageIdx === 1) {
+      // 2. Bellaire Blvd storefronts.
+      skyGrad.addColorStop(0, '#0b1020');
+      skyGrad.addColorStop(1, '#3f1f08');
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height * 0.5);
+      drawStreetLights('#f59e0b', 8);
+
+      const signs = ['PHO', 'TACOS', 'MART', 'WASH', 'VIDEO', 'BBQ'];
+      for (let j = 0; j < signs.length; j++) {
+        const x = (j * (canvas.width / signs.length)) - steerOffset * 2.7;
+        ctx.fillStyle = '#111827';
+        ctx.fillRect(x, canvas.height * 0.33 + (j % 2) * 12, 95, canvas.height * 0.17);
+        ctx.strokeStyle = j % 2 ? '#f59e0b' : '#06b6d4';
+        ctx.strokeRect(x, canvas.height * 0.33 + (j % 2) * 12, 95, canvas.height * 0.17);
+        ctx.fillStyle = j % 2 ? '#fde68a' : '#67e8f9';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(signs[j], x + 47, canvas.height * 0.39 + (j % 2) * 12);
       }
     } else if (stageIdx === 2) {
-      // 3. Cryptic Tunnel interior
-      // Tunnels have black background so we don't draw any distant features, making the neon tunnel rings pop!
-      ctx.fillStyle = '#030712';
-      ctx.fillRect(0, 0, canvas.width, canvas.height * 0.5);
-    } else if (stageIdx === 3) {
-      // 4. Desert sunset
-      skyGrad.addColorStop(0, '#1c0f05');
-      skyGrad.addColorStop(0.6, '#ea580c');
-      skyGrad.addColorStop(1, '#f97316');
+      // 3. Elsik High School campus pass.
+      skyGrad.addColorStop(0, '#081624');
+      skyGrad.addColorStop(1, '#1d4ed8');
       ctx.fillStyle = skyGrad;
       ctx.fillRect(0, 0, canvas.width, canvas.height * 0.5);
 
-      // Distant orange pyramid dunes
-      ctx.fillStyle = '#7c2d12';
+      // Stadium lights and school silhouette.
+      drawStreetLights('#bfdbfe', 5);
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(canvas.width * 0.18 - steerOffset * 1.8, canvas.height * 0.28, canvas.width * 0.64, canvas.height * 0.22);
+      ctx.fillStyle = '#1d4ed8';
+      ctx.fillRect(canvas.width * 0.18 - steerOffset * 1.8, canvas.height * 0.28, canvas.width * 0.64, 16);
+      ctx.strokeStyle = '#60a5fa';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(canvas.width * 0.18 - steerOffset * 1.8, canvas.height * 0.28, canvas.width * 0.64, canvas.height * 0.22);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('ELSIK HIGH SCHOOL  •  RAMS', canvas.width * 0.5 - steerOffset * 1.8, canvas.height * 0.35);
+    } else if (stageIdx === 3) {
+      // 4. High Star / Highstar night sprint.
+      skyGrad.addColorStop(0, '#06131f');
+      skyGrad.addColorStop(1, '#052e16');
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height * 0.5);
+      drawStreetLights('#22c55e', 7);
+
+      ctx.fillStyle = '#065f46';
       ctx.beginPath();
       ctx.moveTo(0, canvas.height * 0.5);
-      ctx.lineTo(canvas.width * 0.3 - steerOffset * 2, canvas.height * 0.35);
-      ctx.lineTo(canvas.width * 0.6, canvas.height * 0.5);
-      ctx.moveTo(canvas.width * 0.4, canvas.height * 0.5);
-      ctx.lineTo(canvas.width * 0.85 - steerOffset * 2, canvas.height * 0.3);
+      ctx.lineTo(canvas.width * 0.28 - steerOffset * 1.4, canvas.height * 0.36);
+      ctx.lineTo(canvas.width * 0.55, canvas.height * 0.5);
+      ctx.moveTo(canvas.width * 0.5, canvas.height * 0.5);
+      ctx.lineTo(canvas.width * 0.82 - steerOffset * 1.4, canvas.height * 0.34);
       ctx.lineTo(canvas.width, canvas.height * 0.5);
       ctx.fill();
+
+      ctx.fillStyle = '#bbf7d0';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('HIGH STAR DR', canvas.width * 0.5 - steerOffset * 1.6, canvas.height * 0.28);
     } else if (stageIdx === 4) {
-      // 5. Snow mountain
-      skyGrad.addColorStop(0, '#071624');
-      skyGrad.addColorStop(1, '#1e293b');
+      // 5. Westpark tollway-style neon dash.
+      skyGrad.addColorStop(0, '#030712');
+      skyGrad.addColorStop(1, '#581c87');
       ctx.fillStyle = skyGrad;
       ctx.fillRect(0, 0, canvas.width, canvas.height * 0.5);
+      drawStreetLights('#ec4899', 9);
 
-      // Big snow peaks
-      ctx.fillStyle = '#475569';
-      ctx.beginPath();
-      ctx.moveTo(0, canvas.height * 0.5);
-      ctx.lineTo(canvas.width * 0.4 - steerOffset * 1.5, canvas.height * 0.18);
-      ctx.lineTo(canvas.width * 0.7, canvas.height * 0.5);
-      ctx.fill();
-
-      ctx.fillStyle = '#94a3b8'; // snowy ice caps
-      ctx.beginPath();
-      ctx.moveTo(canvas.width * 0.35 - steerOffset * 1.5, canvas.height * 0.24);
-      ctx.lineTo(canvas.width * 0.4 - steerOffset * 1.5, canvas.height * 0.18);
-      ctx.lineTo(canvas.width * 0.45 - steerOffset * 1.5, canvas.height * 0.24);
-      ctx.closePath();
-      ctx.fill();
+      ctx.strokeStyle = '#06b6d4';
+      ctx.lineWidth = 1;
+      for (let j = 0; j < 8; j++) {
+        const y = canvas.height * 0.5 - j * 18;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y - Math.sin(j) * 10);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#f0abfc';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('WESTPARK DASH', canvas.width * 0.5 - steerOffset * 2.0, canvas.height * 0.28);
     }
 
     ctx.restore();
@@ -1544,11 +2031,49 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
 
   const toggleGear = () => {
     const s = stateRef.current;
-    if (s.isCountingDown) return;
+    if (s.isCountingDown || s.paused) return;
 
     s.gear = s.gear === 'LOW' ? 'HIGH' : 'LOW';
     audio.playGearChange();
     setUiState(prev => ({ ...prev, gear: s.gear }));
+  };
+
+  const resumeGame = () => {
+    stateRef.current.paused = false;
+    setUiState(prev => ({ ...prev, paused: false }));
+  };
+
+  // Fullscreen (great on mobile). iOS Safari doesn't support element fullscreen,
+  // so the button is hidden there; everywhere else it toggles the whole app.
+  const fullscreenSupported =
+    typeof document !== 'undefined' &&
+    (document.fullscreenEnabled || !!(document.documentElement as any).webkitRequestFullscreen);
+
+  const toggleFullscreen = () => {
+    const doc = document as any;
+    const el = document.documentElement as any;
+    if (document.fullscreenElement || doc.webkitFullscreenElement) {
+      (document.exitFullscreen || doc.webkitExitFullscreen)?.call(document);
+    } else {
+      (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+    }
+  };
+
+  const trackNames = audio.getTrackNames();
+  const cycleRadioTrack = () => {
+    audio.resumeContext();
+    const index = audio.nextTrack();
+    setUiState(prev => ({ ...prev, musicTrackIndex: index }));
+  };
+
+  const toggleDebug = () => {
+    setUiState(prev => {
+      const next = !prev.showDebug;
+      stateRef.current.showDebug = next;
+      // Turning debug off lifts any active debug pause so play can continue.
+      if (!next) stateRef.current.paused = false;
+      return { ...prev, showDebug: next, paused: next ? prev.paused : false };
+    });
   };
 
   const handleTouchLeft = (activate: boolean) => {
@@ -1561,14 +2086,37 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
     updateTouchSteerTarget();
   };
 
+  // Press-and-hold props for the on-screen control buttons. Pointer Events
+  // (not touch+mouse) so every finger is an independent pointer — you can hold
+  // gas and press SHIFT at the same time. touch-action:none keeps a press from
+  // being hijacked by scroll/zoom, and release fires on up/cancel/leave so a
+  // button never gets stuck held.
+  const holdHandlers = (press: () => void, release: () => void) => ({
+    onPointerDown: (e: React.PointerEvent) => { e.preventDefault(); press(); },
+    onPointerUp: release,
+    onPointerCancel: release,
+    onPointerLeave: release,
+    style: { touchAction: 'none' as const },
+  });
+
+  // Tap handler that also works mid-multitouch (e.g. tapping SHIFT while holding
+  // gas): fire on pointer-down rather than a synthesized click.
+  const tapHandler = (action: () => void) => ({
+    onPointerDown: (e: React.PointerEvent) => { e.preventDefault(); action(); },
+    style: { touchAction: 'none' as const },
+  });
+
+  const setAccel = (on: boolean) => { stateRef.current.accelInput = on; };
+  const setBrake = (on: boolean) => { stateRef.current.brakeInput = on; };
+
   const handleStartButton = () => {
     setUiState(prev => ({ ...prev, isFirstInteractionRequired: false }));
     audio.init();
   };
 
   return (
-    <div 
-      className="flex flex-col flex-1 relative w-full items-center justify-center p-2 sm:p-4 bg-slate-950 font-mono outline-none"
+    <div
+      className={`flex flex-col flex-1 min-h-0 relative w-full items-center justify-center bg-slate-950 font-mono outline-none ${uiState.isFullscreen ? 'p-0 gap-0' : 'p-2 sm:p-4'}`}
       tabIndex={0}
       ref={(el) => {
         if (el && !uiState.isFirstInteractionRequired) {
@@ -1582,19 +2130,19 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         <div className="absolute inset-0 z-40 flex flex-col items-center justify-center p-6 bg-slate-950/95 text-center transition-all">
           <div className="border border-red-500/30 rounded-2xl bg-slate-900 p-6 md:p-8 max-w-lg shadow-2xl relative">
             <Radio className="w-12 h-12 mx-auto text-red-500 animate-pulse mb-3" />
-            <div className="text-xs font-mono font-bold uppercase tracking-[0.3em] text-red-500">SPEEDHQ OUTLET</div>
+            <div className="text-xs font-mono font-bold uppercase tracking-[0.3em] text-red-500">ALIEF OUTRUN</div>
             <h2 className="text-4xl font-extrabold text-white uppercase italic mt-1 mb-4 select-none bg-gradient-to-r from-yellow-400 via-orange-500 to-red-500 bg-clip-text text-transparent">
-              TURBO ARCADE
+              ALIEF ARCADE
             </h2>
             
             <p className="text-sm text-slate-300 font-sans leading-relaxed mb-6">
-              Welcome to the Ultimate SpeedHQ Retro Arcade Challenge. Shift gears, dodge high-speed traffic, and beat the clock around winding coasts and neon tunnels!
+              Cruise a fictionalized Alief, TX route past Bellaire Blvd, High Star Dr, Westpark lights, and Elsik High School. Dodge retro traffic and keep your shift timing clean!
             </p>
 
             <div className="bg-slate-950/80 p-4 rounded-xl border border-slate-800 text-left font-sans mb-6">
               <div className="text-xs font-mono font-bold text-slate-400 uppercase tracking-widest flex items-center gap-1.5 border-b border-slate-900 pb-2 mb-2">
                 <Compass className="w-4 h-4 text-cyan-500" />
-                DIVERSE STEERING CONTROL SETTINGS:
+                ALIEF CRUISE CONTROL SETTINGS:
               </div>
               <div className="space-y-4">
                 <div className="flex items-start gap-3">
@@ -1637,11 +2185,11 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         </div>
       ) : null}
 
-      {/* Main HUD overlay panels */}
-      <div className="w-full max-w-3xl flex items-center justify-between gap-2 px-4 py-2.5 bg-slate-950 border border-red-500/30 rounded-t-xl text-slate-400 text-sm font-display tracking-widest select-none neon-glow-red">
+      {/* Main HUD overlay panels (hidden in fullscreen — see the canvas overlay) */}
+      <div className={`w-full max-w-3xl items-center justify-between gap-2 px-4 py-2.5 bg-slate-950 border border-red-500/30 rounded-t-xl text-slate-400 text-sm font-display tracking-widest select-none neon-glow-red ${uiState.isFullscreen ? 'hidden' : 'flex'}`}>
         <div className="flex items-center gap-2">
           <div className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping" />
-          <span className="text-xs font-black text-red-500 neon-text-red">SPEEDHQ LOBBY</span>
+          <span className="text-xs font-black text-red-500 neon-text-red">ALIEF LOBBY</span>
         </div>
         
         <div className="text-center font-black text-yellow-500 flex items-center gap-1 animate-pulse neon-text-yellow">
@@ -1650,6 +2198,16 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         </div>
 
         <div className="flex items-center gap-3">
+          {fullscreenSupported && (
+            <button
+              id="toggle-fullscreen-btn"
+              onClick={toggleFullscreen}
+              className="p-1 text-slate-500 hover:text-slate-100 transition-colors cursor-pointer"
+              title={uiState.isFullscreen ? 'Exit fullscreen' : 'Go fullscreen'}
+            >
+              {uiState.isFullscreen ? <Minimize2 className="w-4 h-4 text-cyan-400" /> : <Maximize2 className="w-4 h-4" />}
+            </button>
+          )}
           <button
             id="toggle-sound-hud-btn"
             onClick={() => updateSettings({ soundEnabled: !settings.soundEnabled })}
@@ -1661,15 +2219,145 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
         </div>
       </div>
 
-      {/* Substantial Canvas Window */}
-      <div className="relative w-full max-w-3xl aspect-[16/10] bg-slate-950 border-x border-cyan-500/30 overflow-hidden shadow-2xl neon-glow-cyan">
+      {/* Substantial Canvas Window. In fullscreen it fills the whole viewport
+          (flex-1, no max width / aspect lock) to maximise the play area. */}
+      <div className={`relative bg-slate-950 overflow-hidden shadow-2xl neon-glow-cyan ${uiState.isFullscreen ? 'w-full flex-1 min-h-0' : 'w-full max-w-3xl aspect-[16/10] border-x border-cyan-500/30'}`}>
         <canvas
           id="retro-racing-canvas"
           ref={canvasRef}
           width={640}
           height={400}
-          className="w-full h-full object-cover select-none cursor-default"
+          className={`w-full h-full select-none cursor-default ${uiState.isFullscreen ? 'object-contain' : 'object-cover'}`}
         />
+
+        {/* Collision debug readout (toggle with the DEBUG button below). relZ is
+            measured from the PLAYER CAR: positive = car ahead, negative = passed. */}
+        {uiState.showDebug && !uiState.isFirstInteractionRequired && (
+          <div className="absolute top-2 left-2 z-20 bg-slate-950/85 border border-cyan-500/40 rounded-md px-2.5 py-1.5 font-mono text-[10px] leading-snug text-cyan-300 pointer-events-none select-none">
+            <div className="text-cyan-400 font-bold tracking-[0.2em] mb-1">COLLISION DEBUG</div>
+            <div>playerX {stateRef.current.playerX.toFixed(2)} · hitbox ±{uiState.debug.nearestHalfWidth.toFixed(2)} · depth {COLLISION_Z_DEPTH}</div>
+            <div>
+              nearest {uiState.debug.nearestType || '—'} · relZ {uiState.debug.nearestRelZ}{' '}
+              <span className={uiState.debug.nearestRelZ >= 0 ? 'text-emerald-400' : 'text-slate-500'}>
+                ({uiState.debug.nearestRelZ >= 0 ? 'AHEAD' : 'BEHIND'})
+              </span>
+            </div>
+            <div className="text-slate-500">camZ {uiState.debug.nearestCamZ} (visible ~800+)</div>
+            <div>
+              lateral {uiState.debug.nearestLateral.toFixed(2)}{' '}
+              <span className={uiState.debug.nearestInLane ? 'text-red-400 font-bold' : 'text-emerald-400'}>
+                {uiState.debug.nearestInLane ? 'IN-LANE' : 'clear'}
+              </span>
+            </div>
+            <div className="text-slate-500">last hit relZ {uiState.debug.lastHitRelZ}</div>
+          </div>
+        )}
+
+        {/* Tilt on a phone: prompt for landscape + a big fullscreen button so the
+            player taps once to get a full, scroll-free play area. Held back until
+            after the start/enable splash so it never covers the START button. */}
+        {settings.steeringMode === 'tilt' && !uiState.isFullscreen && !uiState.isFirstInteractionRequired && (
+          <div className="absolute inset-0 z-40 flex flex-col items-center justify-center text-center px-6 bg-slate-950/92 backdrop-blur-sm pointer-events-auto select-none">
+            {uiState.isPortrait && (
+              <>
+                <RotateCcw className="w-10 h-10 text-cyan-400 animate-pulse mb-2" />
+                <div className="text-cyan-300 font-black tracking-[0.25em] text-base font-mono">ROTATE YOUR PHONE</div>
+                <div className="text-slate-400 text-xs font-sans mt-1 mb-5 max-w-xs">
+                  Tilt steering works best held <span className="text-yellow-300 font-bold">sideways</span>.
+                </div>
+              </>
+            )}
+            {fullscreenSupported && (
+              <button
+                id="enter-fullscreen-cta"
+                onClick={toggleFullscreen}
+                className="flex flex-col items-center gap-2 px-8 py-6 rounded-2xl border-2 border-cyan-400/60 bg-cyan-950/30 text-cyan-200 font-black tracking-widest cursor-pointer active:scale-95 transition-transform shadow-[0_0_30px_rgba(34,211,238,0.25)] animate-pulse"
+              >
+                <Maximize2 className="w-12 h-12" />
+                <span className="text-lg">TAP FOR FULLSCREEN</span>
+                <span className="text-[10px] font-normal text-slate-400 tracking-normal">maximizes the play area</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Fullscreen cockpit controls — overlaid on the canvas since the bottom
+            control bar, dashboard and HUD header are all hidden in fullscreen. */}
+        {uiState.isFullscreen && !stateRef.current.isCountingDown && !uiState.isFirstInteractionRequired && (
+          <>
+            {/* Compact stats + exit-fullscreen (top-right; debug panel is top-left) */}
+            <div className="absolute top-2 right-2 z-30 flex items-center gap-2 pointer-events-auto font-mono">
+              <div className="px-2.5 py-1 rounded-lg bg-slate-950/70 border border-slate-700/50 text-cyan-300 flex items-baseline gap-2">
+                <span className="text-lg font-black leading-none">{Math.round(kmhToMph(uiState.speed))}</span>
+                <span className="text-[8px] text-slate-500">MPH</span>
+                <span className="text-yellow-400 font-bold text-xs">{uiState.gear}</span>
+                <span className="text-slate-400 text-xs">{uiState.time}s</span>
+              </div>
+              <button onClick={toggleFullscreen} title="Exit fullscreen"
+                className="p-2 rounded-lg bg-slate-950/70 border border-slate-700/50 text-cyan-300 cursor-pointer active:scale-95">
+                <Minimize2 className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Tilt indicator + calibrate (top-centre). Hold the phone in your
+                driving pose and tap CALIBRATE to zero the steering. */}
+            {settings.steeringMode === 'tilt' && (
+              <div className="absolute top-2 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center gap-1 bg-slate-950/75 border border-cyan-500/40 rounded-xl px-3 py-1.5 pointer-events-auto font-mono select-none">
+                <div className="flex items-center gap-1 text-[10px] text-slate-400">
+                  <Compass className="w-3.5 h-3.5 text-cyan-400" />
+                  TILT {Math.round(stateRef.current.tiltValue)}°
+                </div>
+                <div className="w-40 h-2.5 bg-slate-950 border border-slate-800 rounded relative overflow-hidden">
+                  {/* centre marker */}
+                  <div className="absolute top-0 bottom-0 left-1/2 w-px bg-slate-600" />
+                  <div
+                    className="absolute top-0 bottom-0 w-2.5 bg-cyan-400 rounded-full transition-all"
+                    style={{ left: `calc(50% - 5px + ${Math.min(Math.max(stateRef.current.steerInput * 100, -100), 100) * 0.5}%)` }}
+                  />
+                </div>
+                <button
+                  id="calibrate-fullscreen-btn"
+                  onClick={calibrateTilt}
+                  className="mt-0.5 px-3 py-1 border border-cyan-500/40 bg-cyan-950/30 text-[10px] font-bold text-cyan-300 rounded cursor-pointer hover:bg-cyan-900/40 active:scale-95 transition-all"
+                >
+                  CALIBRATE CENTER
+                </button>
+              </div>
+            )}
+
+            {/* Steering overlay for d-pad / touch (tilt uses the gyro) */}
+            {settings.steeringMode === 'dpad' && (
+              <div className="absolute bottom-3 left-3 z-30 grid grid-cols-3 grid-rows-2 gap-1.5 pointer-events-auto">
+                <span />
+                <button {...holdHandlers(() => setAccel(true), () => setAccel(false))} aria-label="Accelerate" className="w-14 h-14 rounded-lg border-2 border-emerald-500/40 bg-slate-900/70 active:bg-emerald-500 text-emerald-200 flex items-center justify-center"><ArrowUp className="w-6 h-6" /></button>
+                <span />
+                <button {...holdHandlers(() => handleTouchLeft(true), () => handleTouchLeft(false))} aria-label="Steer left" className="w-14 h-14 rounded-lg border border-slate-700 bg-slate-900/70 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-xl">◀</button>
+                <button {...holdHandlers(() => setBrake(true), () => setBrake(false))} aria-label="Brake" className="w-14 h-14 rounded-lg border-2 border-orange-500/40 bg-slate-900/70 active:bg-orange-500 text-orange-200 flex items-center justify-center"><ArrowDown className="w-6 h-6" /></button>
+                <button {...holdHandlers(() => handleTouchRight(true), () => handleTouchRight(false))} aria-label="Steer right" className="w-14 h-14 rounded-lg border border-slate-700 bg-slate-900/70 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-xl">▶</button>
+              </div>
+            )}
+            {settings.steeringMode === 'touch' && (
+              <div className="absolute bottom-3 left-3 z-30 flex gap-3 pointer-events-auto">
+                <button {...holdHandlers(() => handleTouchLeft(true), () => handleTouchLeft(false))} aria-label="Steer left" className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900/70 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl">◀</button>
+                <button {...holdHandlers(() => handleTouchRight(true), () => handleTouchRight(false))} aria-label="Steer right" className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900/70 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl">▶</button>
+              </div>
+            )}
+
+            {/* SHIFT — bottom centre, always available */}
+            <button {...tapHandler(toggleGear)}
+              className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-xl border-2 border-yellow-500/50 bg-yellow-950/40 active:bg-yellow-500 active:text-slate-950 text-yellow-300 font-black text-sm flex items-center gap-1.5 pointer-events-auto cursor-pointer">
+              <Zap className="w-4 h-4" /> SHIFT <span className="ml-1 px-1.5 rounded bg-slate-950/60 text-cyan-300">{uiState.gear}</span>
+            </button>
+
+            {/* Gas / brake pedals (tilt / touch / keyboard; the d-pad has its own) */}
+            {settings.steeringMode !== 'dpad' && (
+              <div className="absolute bottom-3 right-3 z-30 flex gap-3 pointer-events-auto">
+                <button {...holdHandlers(() => setBrake(true), () => setBrake(false))} aria-label="Brake" className="w-16 h-16 rounded-xl bg-orange-600/90 border-2 border-orange-500/30 text-white flex flex-col items-center justify-center font-black text-[10px] active:bg-orange-500"><ArrowDown className="w-5 h-5" />BRAKE</button>
+                <button {...holdHandlers(() => setAccel(true), () => setAccel(false))} aria-label="Accelerate" className="w-16 h-16 rounded-xl bg-emerald-600/90 border-2 border-emerald-500/30 text-white flex flex-col items-center justify-center font-black text-[10px] active:bg-emerald-500"><ArrowUp className="w-5 h-5" />GAS</button>
+              </div>
+            )}
+          </>
+        )}
 
         {/* 3.. 2.. 1.. GO Countdown */}
         {stateRef.current.isCountingDown && !uiState.isFirstInteractionRequired && (
@@ -1678,7 +2366,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
               {uiState.countdownText}
             </div>
             <div className="text-xs text-yellow-500 tracking-[0.4em] font-mono font-bold mt-4 uppercase animate-pulse">
-              GET READY TO STEER!
+              GET READY FOR ALIEF!
             </div>
           </div>
         )}
@@ -1688,7 +2376,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
           <div className="absolute top-[40%] left-[50%] -translate-x-[50%] -translate-y-[50%] text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 to-yellow-500 font-mono font-extrabold text-4xl tracking-widest animate-bounce z-10 drop-shadow-[0_2px_10px_rgba(234,179,8,0.5)]">
             +{uiState.nearMissScoreAlert.toLocaleString()}
             <div className="text-[10px] text-center text-slate-100 uppercase tracking-[0.2em] mt-1 font-sans">
-              NEAR MISS OVERTAKE!
+              CLEAN ALIEF PASS!
             </div>
           </div>
         )}
@@ -1698,109 +2386,145 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
           <div className="absolute inset-0 border-[6px] border-red-600/60 pointer-events-none animate-flash-border z-10 flex items-start justify-center pt-10">
             <div className="bg-red-950/90 border border-red-500 px-4 py-2 rounded-lg text-red-500 flex items-center gap-2 font-black text-xs uppercase tracking-widest animate-pulse shadow-lg">
               <ShieldAlert className="w-5 h-5 text-red-500" />
-              CRITICAL TIME RUNNING LIMIT OUT!
+              CRITICAL TIME RUNNING OUT!
             </div>
           </div>
         )}
 
-        {/* On-screen Mobile fallback buttons (Touch & Accelerometer modes) */}
-        {!stateRef.current.isCountingDown && !uiState.isFirstInteractionRequired && settings.steeringMode !== 'keyboard' && (
-          <div className="absolute bottom-4 inset-x-4 flex justify-between items-end gap-12 pointer-events-none select-none z-10">
-            {/* Left/Right turn touches (hidden if tilt mode, shown as fallback steering anchors) */}
-            {settings.steeringMode === 'touch' ? (
-              <div className="flex gap-3 pointer-events-auto">
-                <button
-                  id="virtual-steer-left-btn"
-                  onTouchStart={() => handleTouchLeft(true)}
-                  onTouchEnd={() => handleTouchLeft(false)}
-                  onTouchCancel={() => handleTouchLeft(false)}
-                  onMouseDown={() => handleTouchLeft(true)}
-                  onMouseUp={() => handleTouchLeft(false)}
-                  onMouseLeave={() => handleTouchLeft(false)}
-                  className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900/80 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl transition-colors cursor-pointer outline-none select-none"
-                >
-                  ◀
-                </button>
-                <button
-                  id="virtual-steer-right-btn"
-                  onTouchStart={() => handleTouchRight(true)}
-                  onTouchEnd={() => handleTouchRight(false)}
-                  onTouchCancel={() => handleTouchRight(false)}
-                  onMouseDown={() => handleTouchRight(true)}
-                  onMouseUp={() => handleTouchRight(false)}
-                  onMouseLeave={() => handleTouchRight(false)}
-                  className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900/80 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl transition-colors cursor-pointer outline-none select-none"
-                >
-                  ▶
-                </button>
-              </div>
-            ) : (
-              /* Accelerometer Calibration diagnostic hub */
-              <div className="pointer-events-auto bg-slate-900/80 border border-slate-800 rounded-xl px-3 py-1.5 flex flex-col text-[10px] text-slate-400 font-mono gap-1 select-none">
-                <div className="flex items-center gap-1">
-                  <Compass className="w-3.5 h-3.5 text-cyan-400" />
-                  SENSORS: {Math.round(stateRef.current.tiltValue)}°
-                </div>
-                <div className="w-24 h-2.5 bg-slate-950 border border-slate-800 rounded relative overflow-hidden">
-                  <div 
-                    className="absolute top-0 bottom-0 w-2.5 bg-cyan-400 rounded-full transition-all"
-                    style={{ left: `calc(50% - 5px + ${Math.min(Math.max(stateRef.current.steerInput * 100, -100), 100) * 0.5}%)` }}
-                  />
-                </div>
-                <button
-                  id="calibrate-sensor-btn"
-                  onClick={calibrateTilt}
-                  className="mt-1 px-1.5 py-0.5 border border-slate-700 bg-slate-950 text-[9px] font-bold text-center hover:bg-slate-800 text-slate-300 rounded cursor-pointer transition-all"
-                >
-                  CALIBRATE CENTER
-                </button>
-              </div>
-            )}
-
-            {/* Accelerator & Brake Pedals (Always shown in touch/tilt mode for mobile interactions) */}
-            <div className="flex gap-4 pointer-events-auto select-none">
-              <button
-                id="virtual-brake-btn"
-                onTouchStart={() => { stateRef.current.brakeInput = true; }}
-                onTouchEnd={() => { stateRef.current.brakeInput = false; }}
-                onTouchCancel={() => { stateRef.current.brakeInput = false; }}
-                onMouseDown={() => { stateRef.current.brakeInput = true; }}
-                onMouseUp={() => { stateRef.current.brakeInput = false; }}
-                onMouseLeave={() => { stateRef.current.brakeInput = false; }}
-                className="w-16 h-20 rounded-t-lg bg-orange-600 border-2 border-orange-500/30 text-white flex flex-col items-center justify-center transition-colors font-black text-xs shadow-lg active:bg-orange-500 cursor-pointer select-none"
-              >
-                <ArrowDown className="w-5 h-5 mb-1" />
-                BRAKE
-              </button>
-              <button
-                id="virtual-accel-btn"
-                onTouchStart={() => { stateRef.current.accelInput = true; }}
-                onTouchEnd={() => { stateRef.current.accelInput = false; }}
-                onTouchCancel={() => { stateRef.current.accelInput = false; }}
-                onMouseDown={() => { stateRef.current.accelInput = true; }}
-                onMouseUp={() => { stateRef.current.accelInput = false; }}
-                onMouseLeave={() => { stateRef.current.accelInput = false; }}
-                className="w-16 h-24 rounded-t-lg bg-emerald-600 border-2 border-emerald-500/30 text-white flex flex-col items-center justify-center transition-colors font-black text-xs shadow-xl active:bg-emerald-500 cursor-pointer select-none"
-              >
-                <ArrowUp className="w-6 h-6 mb-1 text-emerald-200" />
-                GAS
-              </button>
+        {/* Debug pause card — kept bottom-center so the top-left debug readout
+            stays fully visible for inspection. */}
+        {uiState.paused && (
+          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center gap-2 bg-slate-950/90 border-2 border-cyan-500/50 rounded-xl px-5 py-3 font-mono pointer-events-auto">
+            <div className="text-cyan-400 font-black tracking-[0.25em] text-xs">PAUSED ON COLLISION</div>
+            <div className="text-[10px] text-slate-400">
+              impact relZ <span className="text-yellow-300">{uiState.debug.lastHitRelZ}</span> · full readout top-left ↖
             </div>
+            <button
+              id="resume-btn"
+              onClick={resumeGame}
+              className="px-6 py-2 rounded-lg bg-gradient-to-r from-emerald-500 to-cyan-500 text-slate-950 font-black tracking-wider cursor-pointer active:scale-95 transition-transform outline-none"
+            >
+              ▶ RESUME
+            </button>
           </div>
         )}
+
+        {/* On-screen driving controls live BELOW the canvas (see the control bar
+            after this container) so they never cover the play area. */}
       </div>
 
-      {/* Highly immersive Retro dashboard below the canvas */}
-      <div className="w-full max-w-3xl grid grid-cols-12 gap-2 sm:gap-4 p-4 bg-slate-950 border border-red-500/30 rounded-b-xl select-none text-slate-200 font-mono neon-glow-red">
+      {/* On-screen driving controls — BELOW the canvas so they never cover the
+          play area. Steering varies by mode; SHIFT + DEBUG are always present.
+          In fullscreen these move onto the canvas as overlays (above). */}
+      {!stateRef.current.isCountingDown && !uiState.isFirstInteractionRequired && !uiState.isFullscreen && (
+        <div className="w-full max-w-3xl flex items-center justify-between gap-3 px-4 py-3 bg-slate-950 border-x border-cyan-500/20 select-none">
+          {/* Steering (mode-dependent) */}
+          <div className="flex items-center min-h-[3.5rem]">
+            {settings.steeringMode === 'dpad' && (
+              <div className="grid grid-cols-3 grid-rows-2 gap-1.5">
+                <span />
+                <button id="dpad-up-btn" {...holdHandlers(() => setAccel(true), () => setAccel(false))} aria-label="Accelerate"
+                  className="w-14 h-14 rounded-lg border-2 border-emerald-500/40 bg-slate-900 active:bg-emerald-500 text-emerald-200 flex items-center justify-center cursor-pointer outline-none">
+                  <ArrowUp className="w-6 h-6" />
+                </button>
+                <span />
+                <button id="dpad-left-btn" {...holdHandlers(() => handleTouchLeft(true), () => handleTouchLeft(false))} aria-label="Steer left"
+                  className="w-14 h-14 rounded-lg border border-slate-700 bg-slate-900 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-xl cursor-pointer outline-none">◀</button>
+                <button id="dpad-down-btn" {...holdHandlers(() => setBrake(true), () => setBrake(false))} aria-label="Brake"
+                  className="w-14 h-14 rounded-lg border-2 border-orange-500/40 bg-slate-900 active:bg-orange-500 text-orange-200 flex items-center justify-center cursor-pointer outline-none">
+                  <ArrowDown className="w-6 h-6" />
+                </button>
+                <button id="dpad-right-btn" {...holdHandlers(() => handleTouchRight(true), () => handleTouchRight(false))} aria-label="Steer right"
+                  className="w-14 h-14 rounded-lg border border-slate-700 bg-slate-900 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-xl cursor-pointer outline-none">▶</button>
+              </div>
+            )}
+            {settings.steeringMode === 'touch' && (
+              <div className="flex gap-3">
+                <button id="virtual-steer-left-btn" {...holdHandlers(() => handleTouchLeft(true), () => handleTouchLeft(false))} aria-label="Steer left"
+                  className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl cursor-pointer outline-none">◀</button>
+                <button id="virtual-steer-right-btn" {...holdHandlers(() => handleTouchRight(true), () => handleTouchRight(false))} aria-label="Steer right"
+                  className="w-16 h-16 rounded-xl border border-slate-700 bg-slate-900 active:bg-cyan-600 text-white flex items-center justify-center font-bold text-2xl cursor-pointer outline-none">▶</button>
+              </div>
+            )}
+            {settings.steeringMode === 'tilt' && (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl px-3 py-1.5 flex flex-col text-[10px] text-slate-400 font-mono gap-1">
+                <div className="flex items-center gap-1"><Compass className="w-3.5 h-3.5 text-cyan-400" />SENSORS: {Math.round(stateRef.current.tiltValue)}°</div>
+                <div className="w-24 h-2.5 bg-slate-950 border border-slate-800 rounded relative overflow-hidden">
+                  <div className="absolute top-0 bottom-0 w-2.5 bg-cyan-400 rounded-full transition-all" style={{ left: `calc(50% - 5px + ${Math.min(Math.max(stateRef.current.steerInput * 100, -100), 100) * 0.5}%)` }} />
+                </div>
+                <button id="calibrate-sensor-btn" onClick={calibrateTilt} className="mt-1 px-1.5 py-0.5 border border-slate-700 bg-slate-950 text-[9px] font-bold hover:bg-slate-800 text-slate-300 rounded cursor-pointer">CALIBRATE CENTER</button>
+              </div>
+            )}
+            {settings.steeringMode === 'keyboard' && (
+              <div className="text-[10px] text-slate-500 font-mono leading-relaxed">
+                ◀ ▶ / A D — STEER<br />▲ ▼ / W S — GAS · BRAKE
+              </div>
+            )}
+          </div>
+
+          {/* Shift + Radio + Debug toggle (always available) */}
+          <div className="flex flex-col items-center justify-center gap-2">
+            <button id="shift-gear-btn" {...tapHandler(toggleGear)}
+              className="px-4 py-2 rounded-xl border-2 border-yellow-500/50 bg-yellow-950/30 active:bg-yellow-500 active:text-slate-950 text-yellow-300 font-black text-sm flex items-center gap-1.5 cursor-pointer outline-none transition-colors">
+              <Zap className="w-4 h-4" />
+              SHIFT
+              <span className="ml-1 px-1.5 rounded bg-slate-950/60 text-cyan-300">{uiState.gear}</span>
+            </button>
+            <button id="radio-btn" onClick={cycleRadioTrack} title="Change radio station"
+              className="px-2.5 py-1 rounded-lg border border-fuchsia-500/40 bg-fuchsia-950/20 text-fuchsia-300 text-[10px] font-bold flex items-center gap-1.5 cursor-pointer outline-none transition-colors hover:bg-fuchsia-900/30 active:scale-95">
+              <Radio className="w-3.5 h-3.5" />
+              <span className="tracking-wider">{trackNames[uiState.musicTrackIndex]}</span>
+              <ChevronRight className="w-3 h-3 opacity-70" />
+            </button>
+            <div className="flex items-center gap-1.5" title="Music volume">
+              {settings.musicVolume > 0 ? <Volume2 className="w-3.5 h-3.5 text-fuchsia-300" /> : <VolumeX className="w-3.5 h-3.5 text-slate-500" />}
+              <input
+                type="range"
+                aria-label="Music volume"
+                min="0"
+                max="1"
+                step="0.05"
+                value={settings.musicVolume}
+                onChange={(e) => updateSettings({ musicVolume: parseFloat(e.target.value) })}
+                className="w-24 accent-fuchsia-500 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+            <button onClick={toggleDebug}
+              className={`px-2 py-0.5 rounded border text-[9px] font-bold cursor-pointer transition-colors ${uiState.showDebug ? 'border-cyan-500/50 text-cyan-300 bg-cyan-950/30' : 'border-slate-700 text-slate-500 bg-slate-950'}`}>
+              DEBUG {uiState.showDebug ? 'ON' : 'OFF'}
+            </button>
+          </div>
+
+          {/* Pedals (touch/tilt only — the d-pad already includes gas/brake) */}
+          {(settings.steeringMode === 'touch' || settings.steeringMode === 'tilt') ? (
+            <div className="flex gap-3 items-center">
+              <button id="virtual-brake-btn" {...holdHandlers(() => setBrake(true), () => setBrake(false))} aria-label="Brake"
+                className="w-16 h-16 rounded-xl bg-orange-600 border-2 border-orange-500/30 text-white flex flex-col items-center justify-center font-black text-[10px] active:bg-orange-500 cursor-pointer">
+                <ArrowDown className="w-5 h-5" />BRAKE
+              </button>
+              <button id="virtual-accel-btn" {...holdHandlers(() => setAccel(true), () => setAccel(false))} aria-label="Accelerate"
+                className="w-16 h-16 rounded-xl bg-emerald-600 border-2 border-emerald-500/30 text-white flex flex-col items-center justify-center font-black text-[10px] active:bg-emerald-500 cursor-pointer">
+                <ArrowUp className="w-5 h-5" />GAS
+              </button>
+            </div>
+          ) : (
+            <div className="w-10" />
+          )}
+        </div>
+      )}
+
+      {/* Retro dashboard below the canvas (hidden in fullscreen; a compact
+          speed/gear/time readout overlays the canvas instead). */}
+      <div className={`w-full max-w-3xl grid-cols-12 gap-2 sm:gap-4 p-4 bg-slate-950 border border-red-500/30 rounded-b-xl select-none text-slate-200 font-mono neon-glow-red ${uiState.isFullscreen ? 'hidden' : 'grid'}`}>
         
         {/* Left Dial: Speedometer */}
         <div className="col-span-4 flex flex-col items-center justify-center p-2 bg-slate-950 rounded-xl border border-slate-850 relative overflow-hidden group">
           <div className="text-[10px] text-slate-500 tracking-wider">SPEEDOMETER</div>
           <div className="flex items-baseline mt-1">
             <span className="text-3xl font-bold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-500 group-hover:animate-pulse">
-              {uiState.speed}
+              {Math.round(kmhToMph(uiState.speed))}
             </span>
-            <span className="text-xs text-slate-500 ml-1">KM/H</span>
+            <span className="text-xs text-slate-500 ml-1">MPH</span>
           </div>
           {/* Simulated speed progress bar */}
           <div className="w-full h-1 bg-slate-900 rounded-full mt-2 overflow-hidden">
@@ -1828,7 +2552,7 @@ export default function GameCanvas({ settings, updateSettings, onGameOver }: Gam
           {/* Low/High Gear knob button */}
           <button
             id="gear-shifter-hud-btn"
-            onClick={toggleGear}
+            {...tapHandler(toggleGear)}
             className="flex flex-col items-center justify-center flex-1 pl-2 h-full cursor-pointer hover:bg-slate-900 rounded transition-colors group select-none"
             title="Click or Tap to Shift Gear"
           >

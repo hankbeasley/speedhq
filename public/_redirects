@@ -1,0 +1,3 @@
+# Single-page app fallback: serve index.html for any path (200, not a redirect)
+# so direct hits / refreshes on any URL still load the game.
+/*    /index.html    200

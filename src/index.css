@@ -7,6 +7,21 @@
   --font-display: "Space Grotesk", sans-serif;
 }
 
+/* Touch hardening for the game: kill the long-press "copy/share" callout and
+   text selection so dragging on controls never pops a selection menu, and stop
+   double-tap zoom from delaying/eating taps. Text inputs keep normal selection. */
+html, body {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+  overscroll-behavior: none;
+}
+input, textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 /* Custom Scanlines retro CRT filter overlay */
 .bg-scanlines {
   background: linear-gradient(

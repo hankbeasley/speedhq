@@ -4,12 +4,14 @@
  */
 
 export interface PlayerSettings {
-  steeringMode: 'tilt' | 'touch' | 'keyboard';
+  steeringMode: 'tilt' | 'touch' | 'keyboard' | 'dpad';
   tiltSensitivity: number;
   tiltDeadzone: number;
   lowPrecisionTilt: boolean;
   soundEnabled: boolean;
   musicEnabled: boolean;
+  musicVolume: number; // 0..1
+  sfxVolume: number;   // 0..1
 }
 
 export interface HighScore {
@@ -55,7 +57,7 @@ export interface GameCar {
   offset: number;      // -1 to 1 across the road width
   z: number;           // world z position
   speed: number;       // speed of car (m/s equivalent)
-  spriteType: 'blue' | 'yellow' | 'green' | 'ambulance' | 'truck';
+  spriteType: 'acura_integra' | 'ford_tempo' | 'mr2_86' | 'pontiac_fiero' | 'ford_probe' | 'ambulance' | 'truck';
   width: number;
   length: number;
   color: string;

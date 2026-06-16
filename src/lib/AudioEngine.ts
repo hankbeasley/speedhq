@@ -3,6 +3,51 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+export interface MusicTrack {
+  name: string;
+  bpm: number;
+  bass: number[]; // 16-step bassline (Hz)
+  lead: number[]; // 16-step lead melody (Hz, 0 = rest)
+  bassType: OscillatorType;
+  leadType: OscillatorType;
+}
+
+// A small "radio" of synthesized chiptune loops the player can flip between.
+const MUSIC_TRACKS: MusicTrack[] = [
+  {
+    name: 'NEON CRUISE',
+    bpm: 125,
+    bassType: 'sawtooth',
+    leadType: 'triangle',
+    bass: [110, 110, 110, 110, 130, 130, 130, 130, 146.8, 146.8, 146.8, 146.8, 98, 98, 98, 98],
+    lead: [440, 0, 493.88, 523.25, 0, 587.33, 0, 659.25, 0, 659.25, 587.33, 523.25, 493.88, 0, 440, 0],
+  },
+  {
+    name: 'TURBO PURSUIT',
+    bpm: 152,
+    bassType: 'square',
+    leadType: 'sawtooth',
+    bass: [110, 110, 164.81, 110, 110, 110, 196, 110, 146.83, 146.83, 220, 146.83, 130.81, 130.81, 196, 130.81],
+    lead: [659.25, 0, 783.99, 0, 880, 0, 783.99, 659.25, 587.33, 0, 698.46, 0, 659.25, 0, 0, 0],
+  },
+  {
+    name: 'SUNSET BLVD',
+    bpm: 104,
+    bassType: 'triangle',
+    leadType: 'sine',
+    bass: [98, 98, 98, 98, 87.31, 87.31, 87.31, 87.31, 110, 110, 110, 110, 73.42, 73.42, 73.42, 73.42],
+    lead: [392, 0, 0, 440, 0, 493.88, 0, 0, 523.25, 0, 493.88, 440, 0, 392, 0, 0],
+  },
+  {
+    name: 'ARCADE RUSH',
+    bpm: 140,
+    bassType: 'square',
+    leadType: 'triangle',
+    bass: [130.81, 130.81, 130.81, 130.81, 174.61, 174.61, 174.61, 174.61, 196, 196, 196, 196, 146.83, 146.83, 146.83, 146.83],
+    lead: [523.25, 659.25, 783.99, 659.25, 698.46, 0, 587.33, 0, 659.25, 783.99, 1046.5, 783.99, 659.25, 0, 523.25, 0],
+  },
+];
+
 class AudioEngine {
   private ctx: AudioContext | null = null;
   private masterVolume: GainNode | null = null;
@@ -18,10 +63,16 @@ class AudioEngine {
   // Sequence variables for procedural synth music
   private musicIntervalId: number | null = null;
   private sequencerStep = 0;
+  private currentTrackIndex = 0;
 
-  // State
+  // State + per-bus volume levels (0..1). Music sat at master 0.4 * bus 0.25 ≈
+  // 0.1 before — barely audible — so the defaults are much higher now and are
+  // player-adjustable via the volume controls.
   private soundEnabled = true;
   private musicEnabled = true;
+  private masterLevel = 0.85;
+  private musicLevel = 0.9;
+  private sfxLevel = 0.7;
   private isInitialized = false;
 
   constructor() {
@@ -36,40 +87,62 @@ class AudioEngine {
       this.ctx = new AudioCtx();
       
       this.masterVolume = this.ctx.createGain();
-      this.masterVolume.gain.setValueAtTime(0.5, this.ctx.currentTime);
       this.masterVolume.connect(this.ctx.destination);
 
+      // Music and FX are independent sub-buses off the master.
       this.musicVolume = this.ctx.createGain();
-      this.musicVolume.gain.setValueAtTime(0.25, this.ctx.currentTime);
       this.musicVolume.connect(this.masterVolume);
 
       this.fxVolume = this.ctx.createGain();
-      this.fxVolume.gain.setValueAtTime(0.6, this.ctx.currentTime);
       this.fxVolume.connect(this.masterVolume);
 
       this.startEngineSynth();
       this.startAmbientMusic();
-      
+
       this.isInitialized = true;
-      this.setSoundsEnabled(this.soundEnabled);
-      this.setMusicEnabled(this.musicEnabled);
+      // Apply current levels + enabled flags to the freshly created nodes.
+      this.applyVolumes();
     } catch (e) {
       console.warn("Web Audio is not supported in this frame", e);
     }
   }
 
+  private applyVolumes() {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    this.masterVolume?.gain.setValueAtTime(this.masterLevel, t);
+    this.musicVolume?.gain.setValueAtTime(this.musicEnabled ? this.musicLevel : 0, t);
+    this.fxVolume?.gain.setValueAtTime(this.soundEnabled ? this.sfxLevel : 0, t);
+  }
+
+  private clamp01(v: number) {
+    return Math.min(Math.max(v, 0), 1);
+  }
+
+  public setMasterVolume(level: number) {
+    this.masterLevel = this.clamp01(level);
+    this.applyVolumes();
+  }
+
+  public setMusicVolume(level: number) {
+    this.musicLevel = this.clamp01(level);
+    this.applyVolumes();
+  }
+
+  public setSfxVolume(level: number) {
+    this.sfxLevel = this.clamp01(level);
+    this.applyVolumes();
+  }
+
+  // "FX SOUNDS" now controls only the FX/engine bus; music has its own toggle.
   public setSoundsEnabled(enabled: boolean) {
     this.soundEnabled = enabled;
-    if (this.masterVolume && this.ctx) {
-      this.masterVolume.gain.setValueAtTime(enabled ? 0.4 : 0, this.ctx.currentTime);
-    }
+    this.applyVolumes();
   }
 
   public setMusicEnabled(enabled: boolean) {
     this.musicEnabled = enabled;
-    if (this.musicVolume && this.ctx) {
-      this.musicVolume.gain.setValueAtTime(enabled ? 0.25 : 0, this.ctx.currentTime);
-    }
+    this.applyVolumes();
   }
 
   private startEngineSynth() {
@@ -303,29 +376,15 @@ class AudioEngine {
   }
 
   /**
-   * Starts a dynamic synthesized neon synthwave background loop
+   * Starts the currently-selected chiptune background loop. The step callback
+   * reads the active track each tick, and the interval timing is set from that
+   * track's tempo (switching tracks restarts the interval — see setTrack).
    */
   private startAmbientMusic() {
     if (!this.ctx || !this.musicVolume) return;
 
-    // Tempo: 125 BPM
-    const stepDuration = 60 / 125 / 2; // eighth notes = ~0.24 seconds
-
-    // Simulating simple synthwave tracks: progressive bassline + hi-hat + melodic stab
-    // Steps (16-step grid)
-    const bassline = [
-      110, 110, 110, 110, 
-      130, 130, 130, 130, 
-      146.8, 146.8, 146.8, 146.8, 
-      98, 98, 98, 98
-    ]; // A2, C3, D3, G2
-    
-    const leadNotes = [
-      440, 0, 493.88, 523.25,
-      0, 587.33, 0, 659.25,
-      0, 659.25, 587.33, 523.25,
-      493.88, 0, 440, 0
-    ]; // A Melody
+    const track = MUSIC_TRACKS[this.currentTrackIndex];
+    const stepDuration = 60 / track.bpm / 2; // eighth notes
 
     this.musicIntervalId = window.setInterval(() => {
       if (!this.musicEnabled || !this.ctx || this.ctx.state === 'suspended') {
@@ -333,24 +392,22 @@ class AudioEngine {
       }
 
       try {
+        const t = MUSIC_TRACKS[this.currentTrackIndex];
         const now = this.ctx.currentTime;
         const step = this.sequencerStep % 16;
-        const octaveGroup = Math.floor(this.sequencerStep / 16) % 4; // change melody progression
+        const octaveGroup = Math.floor(this.sequencerStep / 16) % 4; // melody progression
 
-        // Play rolling bass synth (classic 80s arcade pulse)
+        // Rolling bass synth (classic 80s arcade pulse)
         const bassOsc = this.ctx.createOscillator();
         const bassGain = this.ctx.createGain();
-        bassOsc.type = 'sawtooth';
-        
-        // Dynamic octave jumping for authentic synth tick-tock
+        bassOsc.type = t.bassType;
+
         const octaveMultiplier = (step % 2 === 0) ? 0.5 : 1.0;
-        const rootFreq = bassline[step];
-        bassOsc.frequency.setValueAtTime(rootFreq * octaveMultiplier, now);
+        bassOsc.frequency.setValueAtTime(t.bass[step] * octaveMultiplier, now);
 
         bassGain.gain.setValueAtTime(0.12, now);
         bassGain.gain.exponentialRampToValueAtTime(0.01, now + stepDuration * 0.9);
 
-        // Filter out harsh highs for smooth bass
         const bassFilter = this.ctx.createBiquadFilter();
         bassFilter.type = 'lowpass';
         bassFilter.frequency.setValueAtTime(350, now);
@@ -362,18 +419,18 @@ class AudioEngine {
         bassOsc.start(now);
         bassOsc.stop(now + stepDuration);
 
-        // Melodic stabs on certain bars!
-        const melodyNote = leadNotes[(step + octaveGroup * 4) % 16];
+        // Melodic stabs
+        const melodyNote = t.lead[(step + octaveGroup * 4) % 16];
         if (melodyNote > 0 && Math.random() < 0.7) {
           const leadOsc = this.ctx.createOscillator();
           const leadGain = this.ctx.createGain();
           const leadFilter = this.ctx.createBiquadFilter();
 
-          leadOsc.type = 'triangle';
+          leadOsc.type = t.leadType;
           leadOsc.frequency.setValueAtTime(melodyNote, now);
 
           leadFilter.type = 'bandpass';
-          leadFilter.frequency.setValueAtTime(800 + Math.sin(now)*200, now);
+          leadFilter.frequency.setValueAtTime(800 + Math.sin(now) * 200, now);
 
           leadGain.gain.setValueAtTime(0, now);
           leadGain.gain.linearRampToValueAtTime(0.08, now + 0.02);
@@ -387,7 +444,7 @@ class AudioEngine {
           leadOsc.stop(now + stepDuration * 1.8);
         }
 
-        // Simulating electronic woodblock/snare rimshot on steps 4, 8, 12
+        // Electronic snare/rimshot
         if (step % 4 === 2) {
           const snareOsc = this.ctx.createOscillator();
           const snareGain = this.ctx.createGain();
@@ -415,6 +472,32 @@ class AudioEngine {
       clearInterval(this.musicIntervalId);
       this.musicIntervalId = null;
     }
+  }
+
+  // --- Radio: switch between chiptune tracks --------------------------------
+  public getTrackNames(): string[] {
+    return MUSIC_TRACKS.map(t => t.name);
+  }
+
+  public getCurrentTrackIndex(): number {
+    return this.currentTrackIndex;
+  }
+
+  /** Select a track by index (wraps). Restarts the loop at the new tempo. */
+  public setTrack(index: number): number {
+    const count = MUSIC_TRACKS.length;
+    this.currentTrackIndex = ((index % count) + count) % count;
+    this.sequencerStep = 0;
+    if (this.isInitialized) {
+      this.stopAmbientMusic();
+      this.startAmbientMusic();
+    }
+    return this.currentTrackIndex;
+  }
+
+  /** Advance to the next track and return its index. */
+  public nextTrack(): number {
+    return this.setTrack(this.currentTrackIndex + 1);
   }
 
   /**

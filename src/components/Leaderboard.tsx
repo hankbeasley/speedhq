@@ -6,6 +6,7 @@
 import React, { useState, useEffect } from 'react';
 import { Trophy, Star, Play, RotateCcw, Flame } from 'lucide-react';
 import { HighScore } from '../types';
+import { kmhToMph } from '../lib/physics';
 
 interface LeaderboardProps {
   currentScore?: number;
@@ -155,7 +156,7 @@ export default function Leaderboard({
             <div className="col-span-3">DRIVER</div>
             <div className="col-span-3 text-right">SCORE</div>
             <div className="col-span-2 text-center">STAGE</div>
-            <div className="col-span-2 text-right">MAX KMH</div>
+            <div className="col-span-2 text-right">MAX MPH</div>
           </div>
 
           <div className="divide-y divide-slate-900">
@@ -192,7 +193,7 @@ export default function Leaderboard({
                     STAGE {entry.stageReached}
                   </div>
                   <div className="col-span-2 text-right text-xs text-slate-400 font-bold">
-                    {entry.speedAchieved}
+                    {Math.round(kmhToMph(entry.speedAchieved))}
                   </div>
                 </div>
               );

@@ -1,0 +1,7 @@
+# Cloudflare Pages configuration for the SpeedHQ Turbo Racer static SPA.
+# `name` must match the existing Pages project, and `pages_build_output_dir`
+# points Wrangler at Vite's build output so `wrangler pages deploy` needs no
+# extra arguments.
+name = "speedhq"
+compatibility_date = "2026-06-16"
+pages_build_output_dir = "dist"
