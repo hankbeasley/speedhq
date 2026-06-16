@@ -1,0 +1,6 @@
+{
+  "name": "SpeedHQ Turbo Racer",
+  "description": "An arcade-style pseudo-3D retro racing game designed for SpeedHQ.com. Experience nostalgic gameplay inspired by Sega's classic 'Turbo', complete with phone accelerometer steering, gear shifts, multiple scenery segments, and high scores.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

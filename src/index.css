@@ -1,0 +1,114 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700;800&family=JetBrains+Mono:wght@400;500;700;800&family=Inter:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-display: "Space Grotesk", sans-serif;
+}
+
+/* Custom Scanlines retro CRT filter overlay */
+.bg-scanlines {
+  background: linear-gradient(
+    rgba(18, 16, 16, 0) 50%,
+    rgba(0, 0, 0, 0.35) 50%
+  );
+  background-size: 100% 4px;
+}
+
+/* Beautiful animating 80s arcade pseudo-3D perspective cybergrid */
+.bg-cyber-grid {
+  background-image: 
+    linear-gradient(rgba(239, 68, 68, 0.15) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(239, 68, 68, 0.15) 1px, transparent 1px);
+  background-size: 45px 45px;
+  background-position: center;
+  perspective: 450px;
+  transform: perspective(450px) rotateX(60deg) translateY(-10%);
+  transform-origin: top center;
+  animation: cyber-grid-scroll 16s linear infinite;
+  mask-image: linear-gradient(to bottom, transparent 0%, black 75%);
+}
+
+@keyframes cyber-grid-scroll {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 100%;
+  }
+}
+
+/* Glowing flashing low fuel/time warning border animation */
+@keyframes flash-border {
+  0%, 100% {
+    border-color: rgba(239, 68, 68, 0.3);
+    box-shadow: inset 0 0 15px rgba(239, 68, 68, 0.2);
+  }
+  50% {
+    border-color: rgba(239, 68, 68, 0.9);
+    box-shadow: inset 0 0 30px rgba(239, 68, 68, 0.6), 0 0 15px rgba(239, 68, 68, 0.3);
+  }
+}
+
+.animate-flash-border {
+  animation: flash-border 1s ease-in-out infinite;
+}
+
+/* Aesthetic Glassmorphic & Neon styling extensions for components */
+.neon-glow-red {
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.25), inset 0 0 12px rgba(239, 68, 68, 0.15);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.neon-glow-cyan {
+  box-shadow: 0 0 20px rgba(6, 182, 212, 0.25), inset 0 0 12px rgba(6, 182, 212, 0.15);
+  border-color: rgba(6, 182, 212, 0.4);
+}
+
+.neon-glow-yellow {
+  box-shadow: 0 0 20px rgba(234, 179, 8, 0.25), inset 0 0 12px rgba(234, 179, 8, 0.15);
+  border-color: rgba(234, 179, 8, 0.4);
+}
+
+.neon-text-red {
+  text-shadow: 0 0 10px rgba(239, 68, 68, 0.6);
+}
+
+.neon-text-cyan {
+  text-shadow: 0 0 10px rgba(6, 182, 212, 0.6);
+}
+
+.neon-text-yellow {
+  text-shadow: 0 0 10px rgba(234, 179, 8, 0.6);
+}
+
+/* Custom Scrollbar for vintage list aesthetics */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #020617;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 9px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #ef4444;
+}
+
+/* Gentle bounce for dynamic prompts */
+@keyframes micro-bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+.animate-micro-bounce {
+  animation: micro-bounce 2s ease-in-out infinite;
+}
